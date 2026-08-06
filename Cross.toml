@@ -1,0 +1,14 @@
+[target.i686-pc-windows-gnu]
+image = "rustembedded/cross:i686-pc-windows-gnu"
+
+[target.i686-unknown-linux-gnu]
+dockerfile = "docker/Dockerfile.i686-unknown-linux-gnu"
+
+[target.x86_64-pc-windows-gnu]
+image = "rustembedded/cross:x86_64-pc-windows-gnu"
+
+[build.env]
+passthrough = [
+	"PKG_CONFIG_ALLOW_CROSS"
+]
+

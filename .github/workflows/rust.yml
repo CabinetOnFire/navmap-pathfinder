@@ -1,0 +1,155 @@
+name: navmap-pathfinder
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    env:
+      BYOND_MAJOR: 516
+      BYOND_MINOR: 1674
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install BYOND
+        run: |
+          bash scripts/install_byond.sh
+          echo "BYOND_BIN=$env:USERPROFILE\BYOND\byond\bin" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - uses: dtolnay/rust-toolchain@1.89
+        with:
+          targets: i686-pc-windows-msvc
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Clippy
+        run: cargo clippy --target i686-pc-windows-msvc --locked --all-features -- -D warnings
+
+      - name: Rustfmt
+        run: cargo fmt -- --check
+
+      - name: Test
+        run: cargo test --target i686-pc-windows-msvc --locked --all-features
+
+      - name: Build release
+        run: cargo build --target i686-pc-windows-msvc --locked --release
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: Windows Build
+          path: |
+            target/i686-pc-windows-msvc/release/navmap_pathfinder.dll
+            target/i686-pc-windows-msvc/release/navmap_pathfinder.pdb
+            target/navmap_pathfinder.dm
+
+  build-windows-x64:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@1.89
+        with:
+          targets: x86_64-pc-windows-msvc
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Clippy
+        run: cargo clippy --target x86_64-pc-windows-msvc --locked --features allow_non_32bit -- -D warnings
+
+      - name: Rustfmt
+        run: cargo fmt -- --check
+
+      - name: Test
+        run: cargo test --target x86_64-pc-windows-msvc --locked --features allow_non_32bit
+
+      - name: Build release
+        run: cargo build --target x86_64-pc-windows-msvc --locked --release --features allow_non_32bit
+
+      - name: Rename x64 artifacts
+        run: |
+          Move-Item target\x86_64-pc-windows-msvc\release\navmap_pathfinder.dll target\x86_64-pc-windows-msvc\release\navmap_pathfinder64.dll
+          Move-Item target\x86_64-pc-windows-msvc\release\navmap_pathfinder.pdb target\x86_64-pc-windows-msvc\release\navmap_pathfinder64.pdb
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: Windows Build x64
+          path: |
+            target/x86_64-pc-windows-msvc/release/navmap_pathfinder64.dll
+            target/x86_64-pc-windows-msvc/release/navmap_pathfinder64.pdb
+            target/navmap_pathfinder.dm
+
+  build-linux:
+    runs-on: ubuntu-latest
+    env:
+      BYOND_MAJOR: 516
+      BYOND_MINOR: 1674
+      PKG_CONFIG_ALLOW_CROSS: 1
+    steps:
+      - uses: actions/checkout@v6
+
+      - run: |
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install libgcc-s1:i386 g++-multilib zlib1g-dev:i386 libcurl4:i386
+          ./scripts/install_byond.sh
+
+      - uses: dtolnay/rust-toolchain@1.89
+        with:
+          targets: i686-unknown-linux-gnu
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check
+        run: cargo check --target i686-unknown-linux-gnu --locked --all-features
+
+      - name: Test
+        run: cargo test --target i686-unknown-linux-gnu --locked --all-features
+
+      - name: Build release
+        run: cargo build --target i686-unknown-linux-gnu --locked --release
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: Linux Build
+          path: |
+            target/i686-unknown-linux-gnu/release/libnavmap_pathfinder.so
+            target/navmap_pathfinder.dm
+
+  build-linux-x64:
+    runs-on: ubuntu-latest
+    env:
+      PKG_CONFIG_ALLOW_CROSS: 1
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@1.89
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check
+        run: cargo check --target x86_64-unknown-linux-gnu --locked --features allow_non_32bit
+
+      - name: Test
+        run: cargo test --target x86_64-unknown-linux-gnu --locked --features allow_non_32bit
+
+      - name: Build release
+        run: cargo build --target x86_64-unknown-linux-gnu --locked --release --features allow_non_32bit
+
+      - name: Rename x64 artifact
+        run: mv target/x86_64-unknown-linux-gnu/release/libnavmap_pathfinder.so target/x86_64-unknown-linux-gnu/release/libnavmap_pathfinder64.so
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: Linux Build x64
+          path: |
+            target/x86_64-unknown-linux-gnu/release/libnavmap_pathfinder64.so
+            target/navmap_pathfinder.dm

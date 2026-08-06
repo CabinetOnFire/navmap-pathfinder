@@ -1,0 +1,26 @@
+[package]
+name = "navmap-pathfinder"
+edition = "2024"
+version = "0.1.0"
+authors = ["CabinetOnFire"]
+repository = "https://github.com/CabinetOnFire/navmap-pathfinder"
+license = "AGPL-3.0-only"
+description = "BYOND navmap pathfinding for Space Station 13"
+rust-version = "1.89"
+
+[lib]
+crate-type = ["cdylib"]
+
+[profile.release]
+opt-level = 3
+codegen-units = 1
+lto = true
+debug = true
+
+[dependencies]
+meowtonin = "0.3.3"
+thiserror = "2.0"
+
+[features]
+default = []
+allow_non_32bit = []

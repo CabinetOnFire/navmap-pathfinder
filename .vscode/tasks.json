@@ -1,0 +1,72 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "navmap-pathfinder: build (win32)",
+            "type": "process",
+            "command": "cargo",
+            "args": [
+                "build",
+                "--locked",
+                "--target",
+                "i686-pc-windows-msvc"
+            ],
+            "problemMatcher": [
+                "$rustc"
+            ],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            }
+        },
+        {
+            "label": "navmap-pathfinder: build (win64)",
+            "type": "process",
+            "command": "cargo",
+            "args": [
+                "build",
+                "--locked",
+                "--target",
+                "x86_64-pc-windows-msvc",
+                "--features",
+                "allow_non_32bit"
+            ],
+            "problemMatcher": [
+                "$rustc"
+            ],
+            "group": "build"
+        },
+        {
+            "label": "navmap-pathfinder: build (linux32)",
+            "type": "process",
+            "command": "cross",
+            "args": [
+                "build",
+                "--locked",
+                "--target",
+                "i686-unknown-linux-gnu"
+            ],
+            "problemMatcher": [
+                "$rustc"
+            ],
+            "group": "build"
+        },
+        {
+            "label": "navmap-pathfinder: build (linux64)",
+            "type": "process",
+            "command": "cross",
+            "args": [
+                "build",
+                "--locked",
+                "--target",
+                "x86_64-unknown-linux-gnu",
+                "--features",
+                "allow_non_32bit"
+            ],
+            "problemMatcher": [
+                "$rustc"
+            ],
+            "group": "build"
+        }
+    ]
+}
