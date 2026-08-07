@@ -1,6 +1,6 @@
 # navmap-pathfinder
 
-Standalone Rust DLL for `/tg/station` navmap pathfinding.
+Rust DLL for `/tg/station` navmap pathfinding.
 
 The search algorithm intentionally uses an incremental A* implementation. Each
 `start` or `resume` call works for approximately five milliseconds and then returns so we don't take too long on a run and yield to other procs.

@@ -1,4 +1,4 @@
-// DM API for the standalone navmap_pathfinder extension.
+// DM API for the navmap_pathfinder DLL.
 
 #ifndef NAVMAP_PATHFINDER
 /var/__navmap_pathfinder
@@ -61,3 +61,35 @@
 
 #define navmap_bulk_update(flat_list) \
 	NAVMAP_PATHFINDER_CALL(NAVMAP_PATHFINDER, "byond:navmap_bulk_update_ffi")(flat_list)
+
+// Cache the extension probe so a missing or unloadable library does not produce
+// repeated call_ext errors from the game.
+/var/__navmap_pathfinder_available = null
+
+/proc/navmap_pathfinder_mark_unavailable()
+	__navmap_pathfinder_available = FALSE
+
+/proc/navmap_pathfinder_available()
+	if(!isnull(__navmap_pathfinder_available))
+		return __navmap_pathfinder_available
+	try
+		__navmap_pathfinder_available = !!navmap_pathfinder_get_version()
+	catch
+		__navmap_pathfinder_available = FALSE
+	return __navmap_pathfinder_available
+
+/proc/navmap_pathfinder_update(x, y, z, nav_pass)
+	if(!navmap_pathfinder_available())
+		return
+	try
+		navmap_update(x, y, z, nav_pass)
+	catch
+		navmap_pathfinder_mark_unavailable()
+
+/proc/navmap_pathfinder_bulk_update(list/flat_list)
+	if(!length(flat_list) || !navmap_pathfinder_available())
+		return
+	try
+		navmap_bulk_update(flat_list)
+	catch
+		navmap_pathfinder_mark_unavailable()
