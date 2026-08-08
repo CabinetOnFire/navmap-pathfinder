@@ -213,14 +213,75 @@ impl Grid {
         Ok(true)
     }
 
-    fn can_occupy(&mut self, coord: Coord, pass_info: &ByondValue) -> Result<bool, NavPathError> {
+    fn occupiable_info(
+        &mut self,
+        coord: Coord,
+        pass_info: &ByondValue,
+    ) -> Result<Option<TurfInfo>, NavPathError> {
         if !coordinate_allowed(coord, self.start, self.max_range, self.avoid) {
-            return Ok(false);
+            return Ok(None);
         }
-        Ok(matches!(
-            self.lookup(coord.0, coord.1, pass_info)?,
-            Some(info) if turf_allowed(self.simulated_only, info.simulated)
-        ))
+        Ok(self
+            .lookup(coord.0, coord.1, pass_info)?
+            .filter(|info| turf_allowed(self.simulated_only, info.simulated)))
+    }
+
+    fn can_occupy(&mut self, coord: Coord, pass_info: &ByondValue) -> Result<bool, NavPathError> {
+        Ok(self.occupiable_info(coord, pass_info)?.is_some())
+    }
+
+    fn diagonal_routes_from_source(
+        &mut self,
+        source: TurfInfo,
+        from: Coord,
+        to: Coord,
+        pass_info: &ByondValue,
+        stop_after_first: bool,
+    ) -> Result<DiagonalRoutes, NavPathError> {
+        let dx = to.0 - from.0;
+        let dy = to.1 - from.1;
+        let north_south_dir = if dy > 0 { NORTH } else { SOUTH };
+        let east_west_dir = if dx > 0 { EAST } else { WEST };
+        let north_south = (from.0, from.1 + dy);
+        let east_west = (from.0 + dx, from.1);
+
+        let north_south_open = source.open_edges & north_south_dir != 0;
+        let east_west_open = source.open_edges & east_west_dir != 0;
+        if !north_south_open && !east_west_open {
+            return Ok(DiagonalRoutes {
+                north_south_first: false,
+                east_west_first: false,
+            });
+        }
+
+        // Both routes share the destination. Resolve it once instead of repeating the lookup
+        // and occupancy checks for each route.
+        if self.occupiable_info(to, pass_info)?.is_none() {
+            return Ok(DiagonalRoutes {
+                north_south_first: false,
+                east_west_first: false,
+            });
+        }
+
+        // A diagonal is legal only if at least one two-cardinal route through its corner is legal.
+        let north_south_first = north_south_open
+            && self
+                .occupiable_info(north_south, pass_info)?
+                .is_some_and(|info| info.open_edges & east_west_dir != 0);
+        if stop_after_first && north_south_first {
+            return Ok(DiagonalRoutes {
+                north_south_first: true,
+                east_west_first: false,
+            });
+        }
+        let east_west_first = east_west_open
+            && self
+                .occupiable_info(east_west, pass_info)?
+                .is_some_and(|info| info.open_edges & north_south_dir != 0);
+        Ok(DiagonalRoutes {
+            north_south_first,
+            east_west_first,
+        })
     }
 
     fn diagonal_routes(
@@ -235,32 +296,7 @@ impl Grid {
                 east_west_first: false,
             });
         };
-        let dx = to.0 - from.0;
-        let dy = to.1 - from.1;
-        let north_south_dir = if dy > 0 { NORTH } else { SOUTH };
-        let east_west_dir = if dx > 0 { EAST } else { WEST };
-        let north_south = (from.0, from.1 + dy);
-        let east_west = (from.0 + dx, from.1);
-
-        // A diagonal is legal only if at least one two-cardinal route through its corner is legal.
-        let north_south_first = source.open_edges & north_south_dir != 0
-            && self.can_occupy(north_south, pass_info)?
-            && matches!(
-                self.lookup(north_south.0, north_south.1, pass_info)?,
-                Some(info) if info.open_edges & east_west_dir != 0
-            )
-            && self.can_occupy(to, pass_info)?;
-        let east_west_first = source.open_edges & east_west_dir != 0
-            && self.can_occupy(east_west, pass_info)?
-            && matches!(
-                self.lookup(east_west.0, east_west.1, pass_info)?,
-                Some(info) if info.open_edges & north_south_dir != 0
-            )
-            && self.can_occupy(to, pass_info)?;
-        Ok(DiagonalRoutes {
-            north_south_first,
-            east_west_first,
-        })
+        self.diagonal_routes_from_source(source, from, to, pass_info, false)
     }
 
     fn successors(
@@ -277,7 +313,7 @@ impl Grid {
             let walkable = if dx == 0 || dy == 0 {
                 source.open_edges & step != 0 && self.can_occupy(to, pass_info)?
             } else {
-                let routes = self.diagonal_routes(from, to, pass_info)?;
+                let routes = self.diagonal_routes_from_source(source, from, to, pass_info, true)?;
                 routes.north_south_first || routes.east_west_first
             };
             if walkable {
