@@ -78,6 +78,11 @@ must be installed and requires Docker.
 The `scripts/prepare_binaries.sh` script builds all four GNU targets and collects them in
 `target/publish`.
 
-GitHub Actions runs the Linux checks and release build automatically on pushes to `master`
-and pull requests. It can also be started manually from the workflow page with **Run
-workflow**.
+GitHub Actions runs checks and release builds automatically on pushes to `master` and pull
+requests. It can also be started manually from the workflow page with **Run workflow**.
+
+After a successful `master` build, the release workflow reads the package version from
+`Cargo.toml`. If its `v<version>` tag does not exist, it creates the tag and publishes a
+GitHub release using the artifacts from that exact build. Bump `package.version` to publish
+a new version; versions with a prerelease suffix (for example, `0.2.0-beta.1`) are published
+as GitHub prereleases.
