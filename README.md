@@ -55,6 +55,7 @@ cargo build --release --target x86_64-pc-windows-msvc --features allow_non_32bit
 ```
 
 64-bit Linux:
+CURRENTLY DOESN'T WORK; AWAITING MEOWTONIN SUPPORT
 
 ```sh
 PKG_CONFIG_ALLOW_CROSS=1 cargo build --release --target x86_64-unknown-linux-gnu --features allow_non_32bit
@@ -66,6 +67,7 @@ The release workflow publishes the 64-bit files as `navmap_pathfinder64.dll`,
 
 Every build also creates `target/navmap_pathfinder.dm`. Include that file in the DM project
 alongside the matching library.
+
 
 ## VS Code
 
