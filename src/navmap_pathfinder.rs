@@ -1,15 +1,8 @@
-//! A* pathfidnding over a /tg/station style navmap
-//!
-//! From the DM side we send a bitfield of data for each turfs passability in each direction
-//! 4 bits for directions on ground, 4 bits for directions when flying, and 4 bits of "is there something I need to check on the DM side"
-//! There is also a bit for whether this turf is baked at all (If not, we need to FORCE a bake on the DM side, so not ideal)
-//! Lastly, there's a bit to check if the turf is simulated (not space) to see if we should even path here.
-//!
-//! This system creates jobs for each pathfinding pass so we don't get
-//! stuck on massive paths for too long wihtout yielding back to DM
+//! A* pathfinding over a /tg/station-style navmap; DM supplies packed passability data.
+//! Searches yield in short resumable slices to avoid monopolizing the server tick.
 
 use meowtonin::misc::locate_xyz;
-use meowtonin::{ByondError, ByondValue, ByondXYZ, ToByond, byond_fn};
+use meowtonin::{ByondError, ByondValue, ByondXYZ, ToByond, byond_fn, call_global};
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
 use std::sync::{
@@ -19,25 +12,43 @@ use std::sync::{
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
+/// North direction bit.
 const NORTH: i32 = 1;
+/// South direction bit.
 const SOUTH: i32 = 2;
+/// East direction bit.
 const EAST: i32 = 4;
+/// West direction bit.
 const WEST: i32 = 8;
+/// Upward direction bit.
+const UP: i32 = 1 << 4;
+/// Downward direction bit.
+const DOWN: i32 = 1 << 5;
+/// Cardinal directions considered by A*.
 const CARDINALS: [i32; 4] = [NORTH, SOUTH, EAST, WEST];
 
-const FLYING_SHIFT: i32 = 4;
-const COND_SHIFT: i32 = 8;
-const BAKED_FLAG: i32 = 1 << 12;
-const SIMULATED_FLAG: i32 = 1 << 13;
+/// Flying-edge bit offset.
+const FLYING_SHIFT: i32 = 6;
+/// Conditional-edge bit offset.
+const COND_SHIFT: i32 = 12;
+/// Baked-turf flag.
+const BAKED_FLAG: i32 = 1 << 18;
+/// Simulated-turf flag.
+const SIMULATED_FLAG: i32 = 1 << 19;
 
+/// DM value for preserving diagonals.
 const DIAGONAL_DO_NOTHING: i32 = 0;
+/// DM value for removing every diagonal.
 const DIAGONAL_REMOVE_ALL: i32 = 1;
+/// DM value for removing only clunky diagonals.
 const DIAGONAL_REMOVE_CLUNKY: i32 = 2;
 
+/// Maximum time spent in one resumable search slice.
 const SLICE_BUDGET: Duration = Duration::from_millis(5);
+/// Time before an inactive search job expires.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
-///Costs for steps, 10 for cardinal 14 for diagonal
+/// Movement deltas and costs for cardinal and diagonal steps.
 const STEPS: [(i32, i16, i16, u32); 8] = [
     (NORTH, 0, 1, 10),
     (SOUTH, 0, -1, 10),
@@ -49,13 +60,26 @@ const STEPS: [(i32, i16, i16, u32); 8] = [
     (SOUTH | WEST, -1, -1, 14),
 ];
 
+/// A turf position including its z-level.
 type TurfCoords = (i16, i16, i16);
+/// A two-dimensional turf position.
 type Coord = (i16, i16);
 
+/// Cached packed navmap values received from DM.
 static NAV_PASS_CACHE: LazyLock<Mutex<HashMap<TurfCoords, i32>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+/// Active single-z search jobs.
 static SEARCH_JOBS: LazyLock<Mutex<HashMap<u64, SearchJob>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+/// Active multi-z search jobs.
+static MULTI_SEARCH_JOBS: LazyLock<Mutex<HashMap<u64, MultiSearchJob>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+/// Native multi-z topology.
+static TOPOLOGY: LazyLock<Mutex<Topology>> = LazyLock::new(|| Mutex::new(Topology::default()));
+/// Registered cross-z navigation links.
+static NAV_LINKS: LazyLock<Mutex<HashMap<u64, NavLink>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+/// Monotonic identifier source for search jobs.
 static NEXT_JOB_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Error, Debug)]
@@ -70,6 +94,7 @@ enum NavPathError {
     InvalidBulkUpdateLength,
 }
 
+/// Controls how diagonal steps are returned to DM.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DiagonalHandling {
     DoNothing,
@@ -78,6 +103,7 @@ enum DiagonalHandling {
 }
 
 impl DiagonalHandling {
+    /// Converts a DM numeric mode into the native enum.
     fn from_byond(value: &ByondValue) -> Self {
         match value.get_number().unwrap_or(DIAGONAL_DO_NOTHING as f32) as i32 {
             DIAGONAL_REMOVE_ALL => Self::RemoveAll,
@@ -89,28 +115,42 @@ impl DiagonalHandling {
 
 #[derive(Clone, Copy)]
 struct TurfInfo {
+    /// Open cardinal edges for the current mover.
     open_edges: i32,
+    /// Whether the turf is simulated rather than space.
     simulated: bool,
 }
 
 #[derive(Clone, Copy)]
 struct DiagonalRoutes {
+    /// Whether north/south-first is valid.
     north_south_first: bool,
+    /// Whether east/west-first is valid.
     east_west_first: bool,
 }
 
+/// Single-z search grid and its per-job cache.
 struct Grid {
+    /// Search z-level.
     z: i16,
+    /// Pass flags for conditional blockers.
     pass_flags: i32,
+    /// Whether flying edges should be used.
     is_flying: bool,
+    /// Search origin.
     start: Coord,
+    /// Maximum horizontal search range.
     max_range: i32,
+    /// Whether only simulated turfs are allowed.
     simulated_only: bool,
+    /// Optional turf excluded from the search.
     avoid: Option<Coord>,
+    /// Cached turf lookups.
     cache: HashMap<Coord, Option<TurfInfo>>,
 }
 
 impl Grid {
+    /// Looks up and caches one turf's navigation data.
     fn lookup(
         &mut self,
         x: i16,
@@ -136,6 +176,7 @@ impl Grid {
         Ok(entry)
     }
 
+    /// Resolves packed edges and live conditional blockers.
     fn resolve_edges(
         &self,
         coords: TurfCoords,
@@ -144,8 +185,7 @@ impl Grid {
     ) -> Result<(i32, i32), NavPathError> {
         let mut nav_pass = cached_nav_pass(coords).unwrap_or(read_nav_pass(turf)?);
         if nav_pass & BAKED_FLAG == 0 {
-            // Dirty turfs have no trustworthy edge bits. Ask DM to bake now; if that still
-            // does not produce a baked value, treat every edge as blocked for this search. (should not happen but hey)
+            // Bake dirty turfs before trusting their edge bits.
             let _: () = turf.call("nav_bake", std::iter::empty::<ByondValue>())?;
             nav_pass = read_nav_pass(turf)?;
             if nav_pass & BAKED_FLAG == 0 {
@@ -160,7 +200,7 @@ impl Grid {
             if nav_pass & (dir << class_shift) == 0 {
                 continue;
             }
-            // Conditional edges are passable only when their live blocker check agrees. this is probably the most expensive part since we're calling back to DM
+            // Conditional edges require a live DM blocker check.
             if nav_pass & (dir << COND_SHIFT) == 0
                 || self.evaluate_conditional_edge(turf, dir, pass_info)?
             {
@@ -170,6 +210,7 @@ impl Grid {
         Ok((open, nav_pass))
     }
 
+    /// Checks live blockers for one conditional edge.
     fn evaluate_conditional_edge(
         &self,
         turf: &ByondValue,
@@ -213,6 +254,7 @@ impl Grid {
         Ok(true)
     }
 
+    /// Returns cached turf data when the coordinate is occupiable.
     fn occupiable_info(
         &mut self,
         coord: Coord,
@@ -226,10 +268,12 @@ impl Grid {
             .filter(|info| turf_allowed(self.simulated_only, info.simulated)))
     }
 
+    /// Checks whether a coordinate can be occupied.
     fn can_occupy(&mut self, coord: Coord, pass_info: &ByondValue) -> Result<bool, NavPathError> {
         Ok(self.occupiable_info(coord, pass_info)?.is_some())
     }
 
+    /// Evaluates both cardinal routes around a diagonal.
     fn diagonal_routes_from_source(
         &mut self,
         source: TurfInfo,
@@ -284,6 +328,7 @@ impl Grid {
         })
     }
 
+    /// Evaluates a diagonal using its source turf.
     fn diagonal_routes(
         &mut self,
         from: Coord,
@@ -299,6 +344,7 @@ impl Grid {
         self.diagonal_routes_from_source(source, from, to, pass_info, false)
     }
 
+    /// Returns all walkable cardinal and diagonal successors.
     fn successors(
         &mut self,
         from: Coord,
@@ -326,13 +372,18 @@ impl Grid {
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 struct QueueEntry {
+    /// Turf represented by this queue entry.
     coord: Coord,
+    /// Cost already spent reaching the turf.
     cost: u32,
+    /// Cost plus the heuristic estimate.
     estimate: u32,
+    /// Tie-breaker preserving queue order.
     sequence: u64,
 }
 
 impl Ord for QueueEntry {
+    /// Orders entries by lowest estimated path cost.
     fn cmp(&self, other: &Self) -> Ordering {
         other
             .estimate
@@ -343,32 +394,47 @@ impl Ord for QueueEntry {
 }
 
 impl PartialOrd for QueueEntry {
+    /// Delegates partial ordering to the total queue ordering.
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
+/// Result of one single-z search slice.
 enum JobProgress {
     InProgress,
     Found(Vec<Coord>),
     NoPath,
 }
 
+/// Resumable single-z A* search state.
 struct SearchJob {
+    /// Grid and cached passability data.
     grid: Grid,
+    /// Search target.
     goal: Coord,
+    /// Acceptable distance from the target.
     min_target_distance: i32,
+    /// Requested diagonal output mode.
     diagonal_handling: DiagonalHandling,
+    /// Whether the first returned turf is omitted.
     skip_first: bool,
+    /// Frontier ordered by estimated total cost.
     frontier: BinaryHeap<QueueEntry>,
+    /// Best known cost for each visited turf.
     costs: HashMap<Coord, u32>,
+    /// Previous turf for path reconstruction.
     previous: HashMap<Coord, Coord>,
+    /// Whether the start node has been queued.
     initialized: bool,
+    /// Sequence used to break queue ties.
     sequence: u64,
+    /// Last time this job was resumed.
     last_touched: Instant,
 }
 
 impl SearchJob {
+    /// Creates an empty resumable search.
     fn new(
         grid: Grid,
         goal: Coord,
@@ -391,6 +457,7 @@ impl SearchJob {
         }
     }
 
+    /// Advances the search for one time slice.
     fn step(&mut self, pass_info: &ByondValue) -> Result<JobProgress, NavPathError> {
         self.last_touched = Instant::now();
         let started = Instant::now();
@@ -427,6 +494,7 @@ impl SearchJob {
         Ok(JobProgress::InProgress)
     }
 
+    /// Queues a node with its current best cost.
     fn push(&mut self, coord: Coord, cost: u32) {
         self.costs.insert(coord, cost);
         self.sequence += 1;
@@ -438,6 +506,7 @@ impl SearchJob {
         });
     }
 
+    /// Reconstructs a start-to-goal coordinate path.
     fn reconstruct(&self, mut goal: Coord) -> Vec<Coord> {
         let mut path = vec![goal];
         while let Some(&previous) = self.previous.get(&goal) {
@@ -448,6 +517,7 @@ impl SearchJob {
         path
     }
 
+    /// Rechecks and converts a coordinate path to DM turfs.
     fn final_path(
         &mut self,
         nodes: Vec<Coord>,
@@ -473,6 +543,656 @@ impl SearchJob {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+/// Maps a z-level group to its ordered layer.
+struct LayerLocation {
+    /// Connected z-level group identifier.
+    group: i32,
+    /// Zero-based layer within the group.
+    layer: i16,
+}
+
+#[derive(Clone, Debug, Default)]
+/// Native multi-z topology snapshot.
+struct Topology {
+    /// Generation used to invalidate active searches.
+    generation: u64,
+    /// Mapping from z-level to group/layer.
+    z_to_layer: HashMap<i16, LayerLocation>,
+    /// Reverse mapping from group/layer to z-level.
+    layer_to_z: HashMap<(i32, i16), i16>,
+}
+
+#[derive(Clone, Copy, Debug)]
+/// A reusable cross-z transition.
+struct NavLink {
+    /// Stable link identifier.
+    id: u64,
+    /// Link source turf.
+    source: TurfCoords,
+    /// Link destination turf.
+    destination: TurfCoords,
+    /// Traversal cost.
+    cost: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+/// A coordinate paired with its topology layer.
+struct LayeredNode {
+    /// Connected z-level group identifier.
+    group: i32,
+    /// Layer within the connected group.
+    layer: i16,
+    /// Horizontal x coordinate.
+    x: i16,
+    /// Horizontal y coordinate.
+    y: i16,
+}
+
+#[derive(Clone, Copy, Debug)]
+/// Action used to reach a multi-z node.
+enum LayeredAction {
+    None,
+    Vertical(i32),
+    Link(u64),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Queue entry for multi-z A*.
+struct LayeredQueueEntry {
+    /// Node represented by this entry.
+    node: LayeredNode,
+    /// Cost already spent reaching the node.
+    cost: u32,
+    /// Tie-breaker preserving queue order.
+    sequence: u64,
+}
+
+impl Ord for LayeredQueueEntry {
+    /// Orders entries by lowest cost first.
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .cost
+            .cmp(&self.cost)
+            .then_with(|| other.sequence.cmp(&self.sequence))
+    }
+}
+
+impl PartialOrd for LayeredQueueEntry {
+    /// Delegates partial ordering to the queue ordering.
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Multi-z search grid and its per-job cache.
+struct LayeredGrid {
+    /// Topology snapshot used by this search.
+    topology: Topology,
+    /// Pass flags for conditional blockers.
+    pass_flags: i32,
+    /// Whether flying edges should be used.
+    is_flying: bool,
+    /// Search origin node.
+    start: LayeredNode,
+    /// Maximum horizontal search range.
+    max_range: i32,
+    /// Maximum total path cost, or zero for unlimited.
+    max_cost: u32,
+    /// Whether only simulated turfs are allowed.
+    simulated_only: bool,
+    /// Optional node excluded from the search.
+    avoid: Option<LayeredNode>,
+    /// Cached node lookups.
+    cache: HashMap<LayeredNode, Option<TurfInfo>>,
+}
+
+impl LayeredGrid {
+    /// Resolves a layered node to its z-level.
+    fn z_for(&self, node: LayeredNode) -> Option<i16> {
+        self.topology
+            .layer_to_z
+            .get(&(node.group, node.layer))
+            .copied()
+    }
+
+    /// Looks up and caches one layered turf.
+    fn lookup(
+        &mut self,
+        node: LayeredNode,
+        pass_info: &ByondValue,
+    ) -> Result<Option<TurfInfo>, NavPathError> {
+        if let Some(hit) = self.cache.get(&node) {
+            return Ok(*hit);
+        }
+        let Some(z) = self.z_for(node) else {
+            self.cache.insert(node, None);
+            return Ok(None);
+        };
+        let turf = locate_xyz(ByondXYZ::new(node.x, node.y, z))?;
+        let entry = if turf.is_null() {
+            None
+        } else {
+            let (open_edges, vertical_open, nav_pass) =
+                self.resolve_edges((node.x, node.y, z), &turf, pass_info)?;
+            Some(TurfInfo {
+                open_edges,
+                simulated: nav_pass_is_simulated(nav_pass),
+            })
+            .map(|info| TurfInfo {
+                open_edges: info.open_edges | (vertical_open << 24),
+                ..info
+            })
+        };
+        self.cache.insert(node, entry);
+        Ok(entry)
+    }
+
+    /// Resolves horizontal and vertical edges for a layered turf.
+    fn resolve_edges(
+        &self,
+        coords: TurfCoords,
+        turf: &ByondValue,
+        pass_info: &ByondValue,
+    ) -> Result<(i32, i32, i32), NavPathError> {
+        let mut nav_pass = cached_nav_pass(coords).unwrap_or(read_nav_pass(turf)?);
+        if nav_pass & BAKED_FLAG == 0 {
+            let _: () = turf.call("nav_bake", std::iter::empty::<ByondValue>())?;
+            nav_pass = read_nav_pass(turf)?;
+            if nav_pass & BAKED_FLAG == 0 {
+                return Ok((0, 0, nav_pass));
+            }
+            cache_nav_pass(coords, nav_pass);
+        }
+        let mut open = 0;
+        for dir in CARDINALS {
+            if nav_pass & (dir << if self.is_flying { FLYING_SHIFT } else { 0 }) == 0 {
+                continue;
+            }
+            if nav_pass & (dir << COND_SHIFT) == 0
+                || evaluate_conditional_edge(turf, dir, self.pass_flags, pass_info)?
+            {
+                open |= dir;
+            }
+        }
+        let mut vertical = 0;
+        if self.is_flying {
+            for dir in [UP, DOWN] {
+                let nav_bit = dir << FLYING_SHIFT;
+                let cond_bit = dir << COND_SHIFT;
+                if nav_pass & nav_bit == 0 {
+                    continue;
+                }
+                if nav_pass & cond_bit == 0
+                    || evaluate_conditional_edge(turf, dir, self.pass_flags, pass_info)?
+                {
+                    vertical |= dir;
+                }
+            }
+        }
+        Ok((open, vertical, nav_pass))
+    }
+
+    /// Returns cached node data when the node is occupiable.
+    fn occupiable_info(
+        &mut self,
+        node: LayeredNode,
+        pass_info: &ByondValue,
+    ) -> Result<Option<TurfInfo>, NavPathError> {
+        if self.max_range > 0
+            && chebyshev_distance((node.x, node.y), (self.start.x, self.start.y)) > self.max_range
+        {
+            return Ok(None);
+        }
+        if self.avoid == Some(node) {
+            return Ok(None);
+        }
+        Ok(self
+            .lookup(node, pass_info)?
+            .filter(|info| turf_allowed(self.simulated_only, info.simulated)))
+    }
+
+    /// Checks whether a layered node can be occupied.
+    fn can_occupy(
+        &mut self,
+        node: LayeredNode,
+        pass_info: &ByondValue,
+    ) -> Result<bool, NavPathError> {
+        Ok(self.occupiable_info(node, pass_info)?.is_some())
+    }
+
+    /// Evaluates both cardinal routes around a diagonal.
+    fn diagonal_routes(
+        &mut self,
+        from: LayeredNode,
+        to: LayeredNode,
+        pass_info: &ByondValue,
+    ) -> Result<DiagonalRoutes, NavPathError> {
+        let Some(source) = self.lookup(from, pass_info)? else {
+            return Ok(DiagonalRoutes {
+                north_south_first: false,
+                east_west_first: false,
+            });
+        };
+        let dx = to.x - from.x;
+        let dy = to.y - from.y;
+        let ns = if dy > 0 { NORTH } else { SOUTH };
+        let ew = if dx > 0 { EAST } else { WEST };
+        if source.open_edges & ns == 0 && source.open_edges & ew == 0 {
+            return Ok(DiagonalRoutes {
+                north_south_first: false,
+                east_west_first: false,
+            });
+        }
+        if self.occupiable_info(to, pass_info)?.is_none() {
+            return Ok(DiagonalRoutes {
+                north_south_first: false,
+                east_west_first: false,
+            });
+        }
+        let ns_node = LayeredNode {
+            x: from.x,
+            y: to.y,
+            ..from
+        };
+        let ew_node = LayeredNode {
+            x: to.x,
+            y: from.y,
+            ..from
+        };
+        Ok(DiagonalRoutes {
+            north_south_first: source.open_edges & ns != 0
+                && self
+                    .occupiable_info(ns_node, pass_info)?
+                    .is_some_and(|info| info.open_edges & ew != 0),
+            east_west_first: source.open_edges & ew != 0
+                && self
+                    .occupiable_info(ew_node, pass_info)?
+                    .is_some_and(|info| info.open_edges & ns != 0),
+        })
+    }
+
+    /// Returns horizontal, vertical, and linked successors.
+    fn successors(
+        &mut self,
+        from: LayeredNode,
+        pass_info: &ByondValue,
+    ) -> Result<Vec<(LayeredNode, u32, LayeredAction)>, NavPathError> {
+        let Some(source) = self.lookup(from, pass_info)? else {
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::with_capacity(12);
+        for (step, dx, dy, cost) in STEPS {
+            let to = LayeredNode {
+                x: from.x + dx,
+                y: from.y + dy,
+                ..from
+            };
+            let walkable = if dx == 0 || dy == 0 {
+                source.open_edges & step != 0 && self.can_occupy(to, pass_info)?
+            } else {
+                let routes = self.diagonal_routes(from, to, pass_info)?;
+                routes.north_south_first || routes.east_west_first
+            };
+            if walkable {
+                out.push((to, cost, LayeredAction::None));
+            }
+        }
+        if self.is_flying {
+            let vertical = source.open_edges >> 24;
+            for (dir, delta) in [(UP, 1), (DOWN, -1)] {
+                if vertical & dir == 0 {
+                    continue;
+                }
+                let to = LayeredNode {
+                    layer: from.layer + delta,
+                    ..from
+                };
+                if self.can_occupy(to, pass_info)? {
+                    out.push((to, 10, LayeredAction::Vertical(dir)));
+                }
+            }
+        }
+        let links = NAV_LINKS.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let Some(source_z) = self.z_for(from) else {
+            return Ok(out);
+        };
+        for link in links
+            .values()
+            .filter(|link| link.source == (from.x, from.y, source_z))
+        {
+            let Some(destination_layer) = self.topology.z_to_layer.get(&link.destination.2) else {
+                continue;
+            };
+            let to = LayeredNode {
+                group: destination_layer.group,
+                layer: destination_layer.layer,
+                x: link.destination.0,
+                y: link.destination.1,
+            };
+            if !self.can_occupy(to, pass_info)? {
+                continue;
+            }
+            let allowed: ByondValue = call_global(
+                "navmap_pathfinder_link_can_plan",
+                [ByondValue::new_num(link.id as f32), pass_info.clone()],
+            )?;
+            if truthy(&allowed) {
+                out.push((to, link.cost, LayeredAction::Link(link.id)));
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// Result of one multi-z search slice.
+enum MultiJobProgress {
+    InProgress,
+    Found(LayeredNode),
+    NoPath,
+    Stale,
+}
+
+/// Resumable multi-z A* search state.
+struct MultiSearchJob {
+    /// Layered grid and topology snapshot.
+    grid: LayeredGrid,
+    /// Search target node.
+    goal: LayeredNode,
+    /// Acceptable distance from the target.
+    min_target_distance: i32,
+    /// Requested diagonal output mode.
+    diagonal_handling: DiagonalHandling,
+    /// Whether the first returned turf is omitted.
+    skip_first: bool,
+    /// Frontier ordered by path cost.
+    frontier: BinaryHeap<LayeredQueueEntry>,
+    /// Best known cost for each visited node.
+    costs: HashMap<LayeredNode, u32>,
+    /// Previous node and action for reconstruction.
+    previous: HashMap<LayeredNode, (LayeredNode, LayeredAction)>,
+    /// Whether the start node has been queued.
+    initialized: bool,
+    /// Sequence used to break queue ties.
+    sequence: u64,
+    /// Last time this job was resumed.
+    last_touched: Instant,
+}
+
+impl MultiSearchJob {
+    /// Advances the search for one time slice.
+    fn step(&mut self, pass_info: &ByondValue) -> Result<MultiJobProgress, NavPathError> {
+        self.last_touched = Instant::now();
+        if topology_generation() != self.grid.topology.generation {
+            return Ok(MultiJobProgress::Stale);
+        }
+        let started = Instant::now();
+        if !self.initialized {
+            self.initialized = true;
+            if !self.grid.can_occupy(self.grid.start, pass_info)? {
+                return Ok(MultiJobProgress::NoPath);
+            }
+            self.push(self.grid.start, 0);
+        }
+        while started.elapsed() < SLICE_BUDGET {
+            let Some(current) = self.frontier.pop() else {
+                return Ok(MultiJobProgress::NoPath);
+            };
+            if self.costs.get(&current.node).copied() != Some(current.cost) {
+                continue;
+            }
+            if current.node.group == self.goal.group
+                && current.node.layer == self.goal.layer
+                && chebyshev_distance((current.node.x, current.node.y), (self.goal.x, self.goal.y))
+                    <= self.min_target_distance
+            {
+                return Ok(MultiJobProgress::Found(current.node));
+            }
+            for (next, movement_cost, action) in self.grid.successors(current.node, pass_info)? {
+                let next_cost = current.cost.saturating_add(movement_cost);
+                if self.grid.max_cost > 0 && next_cost > self.grid.max_cost {
+                    continue;
+                }
+                if self.costs.get(&next).is_none_or(|&old| next_cost < old) {
+                    self.previous.insert(next, (current.node, action));
+                    self.push(next, next_cost);
+                }
+            }
+        }
+        Ok(MultiJobProgress::InProgress)
+    }
+
+    /// Queues a node with its current best cost.
+    fn push(&mut self, node: LayeredNode, cost: u32) {
+        self.costs.insert(node, cost);
+        self.sequence += 1;
+        self.frontier.push(LayeredQueueEntry {
+            node,
+            cost,
+            sequence: self.sequence,
+        });
+    }
+
+    /// Reconstructs nodes and actions from the goal.
+    fn reconstruct(&self, mut node: LayeredNode) -> (Vec<LayeredNode>, Vec<LayeredAction>) {
+        let mut nodes = vec![node];
+        // Keep each action beside its destination while unwinding; the start
+        // node receives a sentinel after both lists are reversed.
+        let mut actions = Vec::new();
+        while let Some((previous, action)) = self.previous.get(&node).copied() {
+            nodes.push(previous);
+            actions.push(action);
+            node = previous;
+        }
+        nodes.reverse();
+        actions.reverse();
+        actions.insert(0, LayeredAction::None);
+        (nodes, actions)
+    }
+
+    /// Rechecks and converts a layered path to DM values.
+    fn final_path(
+        &mut self,
+        goal: LayeredNode,
+        pass_info: &ByondValue,
+    ) -> Result<(ByondValue, ByondValue), NavPathError> {
+        let (raw_nodes, raw_actions) = self.reconstruct(goal);
+        let mut nodes = vec![raw_nodes[0]];
+        let mut actions = vec![LayeredAction::None];
+        for (index, next) in raw_nodes.iter().copied().enumerate().skip(1) {
+            let previous = *nodes.last().unwrap();
+            if previous.group == next.group
+                && previous.layer == next.layer
+                && previous.x != next.x
+                && previous.y != next.y
+                && matches!(raw_actions[index], LayeredAction::None)
+            {
+                let routes = self.grid.diagonal_routes(previous, next, pass_info)?;
+                let intermediate = match self.diagonal_handling {
+                    DiagonalHandling::RemoveAll if routes.north_south_first => Some(LayeredNode {
+                        x: previous.x,
+                        y: next.y,
+                        ..previous
+                    }),
+                    DiagonalHandling::RemoveAll if routes.east_west_first => Some(LayeredNode {
+                        x: next.x,
+                        y: previous.y,
+                        ..previous
+                    }),
+                    DiagonalHandling::RemoveAll => return empty_list_pair(),
+                    DiagonalHandling::RemoveClunky
+                        if !routes.north_south_first && routes.east_west_first =>
+                    {
+                        Some(LayeredNode {
+                            x: next.x,
+                            y: previous.y,
+                            ..previous
+                        })
+                    }
+                    _ => None,
+                };
+                if let Some(intermediate) = intermediate {
+                    nodes.push(intermediate);
+                    actions.push(LayeredAction::None);
+                }
+            }
+            nodes.push(next);
+            actions.push(raw_actions[index]);
+        }
+        let mut path_values = Vec::new();
+        for node in &nodes {
+            let Some(z) = self.grid.z_for(*node) else {
+                return empty_list_pair();
+            };
+            let turf = locate_xyz(ByondXYZ::new(node.x, node.y, z))?;
+            if turf.is_null() {
+                return empty_list_pair();
+            }
+            path_values.push(turf);
+        }
+        if self.skip_first && !path_values.is_empty() {
+            let _ = path_values.remove(0);
+            actions.remove(0);
+        }
+        let path = path_values.to_byond()?;
+        let action_values = actions
+            .into_iter()
+            .map(|action| match action {
+                LayeredAction::None => ByondValue::NULL,
+                LayeredAction::Vertical(dir) => ByondValue::new_num(dir as f32),
+                LayeredAction::Link(id) => ByondValue::new_num(-(id as f32)),
+            })
+            .collect::<Vec<_>>();
+        let action_list = action_values.to_byond()?;
+        Ok((path, action_list))
+    }
+}
+
+/// Returns empty path and action lists for a multi-z result.
+fn empty_list_pair() -> Result<(ByondValue, ByondValue), NavPathError> {
+    Ok((empty_list()?, ByondValue::new_list()?))
+}
+
+/// Reads the current native topology generation.
+fn topology_generation() -> u64 {
+    TOPOLOGY
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .generation
+}
+
+/// Evaluates live blockers for one packed edge.
+fn evaluate_conditional_edge(
+    turf: &ByondValue,
+    dir: i32,
+    pass_flags: i32,
+    pass_info: &ByondValue,
+) -> Result<bool, NavPathError> {
+    let blockers_list: ByondValue = turf.read_var("nav_blockers")?;
+    if blockers_list.is_null() {
+        return Ok(true);
+    }
+    let entries = match blockers_list.read_list_index::<_, ByondValue>(&dir.to_string()) {
+        Ok(value) if value.is_list() => value.read_list()?,
+        _ => return Ok(true),
+    };
+    for entry in entries {
+        if entry.is_number() {
+            if pass_flags & entry.get_number()? as i32 == 0 {
+                return Ok(false);
+            }
+            continue;
+        }
+        let blocker_loc: ByondValue = entry.read_var("loc")?;
+        let eval_dir = if blocker_loc == *turf {
+            dir
+        } else {
+            reverse_dir(dir)
+        };
+        let result = entry.call(
+            "CanAStarPass",
+            &[ByondValue::new_num(eval_dir as f32), pass_info.clone()],
+        )?;
+        if !truthy(&result) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Converts world coordinates into a layered node.
+fn node_for_xyz(topology: &Topology, x: i16, y: i16, z: i16) -> Option<LayeredNode> {
+    let layer = topology.z_to_layer.get(&z)?;
+    Some(LayeredNode {
+        group: layer.group,
+        layer: layer.layer,
+        x,
+        y,
+    })
+}
+
+/// Builds a multi-z search from FFI arguments.
+fn new_multi_search_job(
+    start: ByondValue,
+    end: ByondValue,
+    pass_info: &ByondValue,
+    is_flying: ByondValue,
+    max_range: ByondValue,
+    min_target_distance: ByondValue,
+    simulated_only: ByondValue,
+    avoid_turf: ByondValue,
+    diagonal_handling: ByondValue,
+    skip_first: ByondValue,
+    max_path_cost: ByondValue,
+) -> Result<Option<MultiSearchJob>, NavPathError> {
+    let start_xyz = start.xyz().ok_or(NavPathError::NotATurf)?;
+    let end_xyz = end.xyz().ok_or(NavPathError::NotATurf)?;
+    let topology = TOPOLOGY.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    let start_node = node_for_xyz(&topology, start_xyz.x(), start_xyz.y(), start_xyz.z());
+    let goal_node = node_for_xyz(&topology, end_xyz.x(), end_xyz.y(), end_xyz.z());
+    let (Some(start_node), Some(goal_node)) = (start_node, goal_node) else {
+        return Ok(None);
+    };
+    let max_range = max_range.get_number().unwrap_or(0.0).max(0.0) as i32;
+    let min_target_distance = min_target_distance.get_number().unwrap_or(0.0).max(0.0) as i32;
+    let max_path_cost = max_path_cost.get_number().unwrap_or(0.0).max(0.0) as u32;
+    let avoid = if avoid_turf.is_null() {
+        None
+    } else {
+        let xyz = avoid_turf.xyz().ok_or(NavPathError::NotATurf)?;
+        node_for_xyz(&topology, xyz.x(), xyz.y(), xyz.z())
+    };
+    let pass_flags = pass_info
+        .read_var::<_, ByondValue>("pass_flags")
+        .and_then(|value| value.get_number())
+        .map(|number| number as i32)
+        .unwrap_or(0);
+    Ok(Some(MultiSearchJob {
+        grid: LayeredGrid {
+            topology: topology.clone(),
+            pass_flags,
+            is_flying: truthy(&is_flying),
+            start: start_node,
+            max_range,
+            max_cost: max_path_cost,
+            simulated_only: truthy(&simulated_only),
+            avoid,
+            cache: HashMap::new(),
+        },
+        goal: goal_node,
+        min_target_distance,
+        diagonal_handling: DiagonalHandling::from_byond(&diagonal_handling),
+        skip_first: truthy(&skip_first),
+        frontier: BinaryHeap::new(),
+        costs: HashMap::new(),
+        previous: HashMap::new(),
+        initialized: false,
+        sequence: 0,
+        last_touched: Instant::now(),
+    }))
+}
+
+/// Reads one packed navmap value from the shared cache.
 fn cached_nav_pass(coords: TurfCoords) -> Option<i32> {
     NAV_PASS_CACHE
         .lock()
@@ -481,6 +1201,7 @@ fn cached_nav_pass(coords: TurfCoords) -> Option<i32> {
         .copied()
 }
 
+/// Stores one packed navmap value in the shared cache.
 fn cache_nav_pass(coords: TurfCoords, nav_pass: i32) {
     // DM publishes both baked values and invalidations here. Keeping an unbaked value is
     // intentional: resolve_edges will force a fresh bake before using it.
@@ -490,16 +1211,20 @@ fn cache_nav_pass(coords: TurfCoords, nav_pass: i32) {
         .insert(coords, nav_pass);
 }
 
+/// Returns the opposite cardinal or vertical direction.
 fn reverse_dir(dir: i32) -> i32 {
     match dir {
         NORTH => SOUTH,
         SOUTH => NORTH,
         EAST => WEST,
         WEST => EAST,
+        UP => DOWN,
+        DOWN => UP,
         other => other,
     }
 }
 
+/// Reads packed navmap data from a DM turf.
 fn read_nav_pass(turf: &ByondValue) -> Result<i32, NavPathError> {
     Ok(turf
         .read_var::<_, ByondValue>("nav_pass")
@@ -508,26 +1233,32 @@ fn read_nav_pass(turf: &ByondValue) -> Result<i32, NavPathError> {
         .unwrap_or(0))
 }
 
+/// Converts a DM value to the pathfinder's truth value.
 fn truthy(value: &ByondValue) -> bool {
     !value.is_null() && (!value.is_number() || value.get_number().is_ok_and(|number| number != 0.0))
 }
 
+/// Checks range and avoidance constraints for a coordinate.
 fn coordinate_allowed(coord: Coord, start: Coord, max_range: i32, avoid: Option<Coord>) -> bool {
     (max_range <= 0 || chebyshev_distance(coord, start) <= max_range) && avoid != Some(coord)
 }
 
+/// Checks whether a turf matches the simulated-only filter.
 fn turf_allowed(simulated_only: bool, simulated: bool) -> bool {
     !simulated_only || simulated
 }
 
+/// Checks the packed simulated-turf flag.
 fn nav_pass_is_simulated(nav_pass: i32) -> bool {
     nav_pass & SIMULATED_FLAG != 0
 }
 
+/// Returns grid distance using the larger axis delta.
 fn chebyshev_distance(a: Coord, b: Coord) -> i32 {
     (a.0 - b.0).unsigned_abs().max((a.1 - b.1).unsigned_abs()) as i32
 }
 
+/// Estimates remaining octile cost to the target radius.
 fn heuristic_to_target_range(coord: Coord, goal: Coord, target_distance: i32) -> u32 {
     // Octile distance remains admissible for cardinal cost 10 and diagonal cost 14.
     let dx = ((coord.0 - goal.0).unsigned_abs() as i32 - target_distance).max(0) as u32;
@@ -536,6 +1267,7 @@ fn heuristic_to_target_range(coord: Coord, goal: Coord, target_distance: i32) ->
 }
 
 #[cfg(test)]
+/// Expands diagonals without fallible native lookups.
 fn expand_diagonals<F>(
     nodes: &[Coord],
     handling: DiagonalHandling,
@@ -576,6 +1308,7 @@ where
     Some(expanded)
 }
 
+/// Expands diagonals while rechecking native passability.
 fn expand_diagonals_checked<F, E>(
     nodes: &[Coord],
     handling: DiagonalHandling,
@@ -618,6 +1351,7 @@ where
     Ok(Some(expanded))
 }
 
+/// Removes the starting node when requested by DM.
 fn apply_skip_first(mut nodes: Vec<Coord>, skip_first: bool) -> Vec<Coord> {
     if skip_first && !nodes.is_empty() {
         nodes.remove(0);
@@ -625,10 +1359,12 @@ fn apply_skip_first(mut nodes: Vec<Coord>, skip_first: bool) -> Vec<Coord> {
     nodes
 }
 
+/// Creates an empty DM list.
 fn empty_list() -> Result<ByondValue, NavPathError> {
     Ok(Vec::<ByondValue>::new().to_byond()?)
 }
 
+/// Builds a standard native pathfinder response.
 fn status_response(
     status: &str,
     job_id: Option<u64>,
@@ -658,6 +1394,22 @@ fn status_response(
     Ok(result)
 }
 
+/// Builds a pathfinder response with action data.
+fn status_response_with_actions(
+    status: &str,
+    job_id: Option<u64>,
+    path: Option<ByondValue>,
+    actions: Option<ByondValue>,
+    error: Option<&str>,
+) -> Result<ByondValue, NavPathError> {
+    let mut result = status_response(status, job_id, path, error)?;
+    if let Some(actions) = actions {
+        result.write_list_index(ByondValue::new_string("actions"), actions)?;
+    }
+    Ok(result)
+}
+
+/// Parses a numeric or string job identifier.
 fn parse_job_id(value: &ByondValue) -> Option<u64> {
     if value.is_number() {
         let number = value.get_number().ok()?;
@@ -666,11 +1418,19 @@ fn parse_job_id(value: &ByondValue) -> Option<u64> {
     value.get_string().ok()?.parse().ok()
 }
 
+/// Removes expired single-z jobs.
 fn prune_expired_jobs(jobs: &mut HashMap<u64, SearchJob>) {
     let now = Instant::now();
     jobs.retain(|_, job| now.duration_since(job.last_touched) < IDLE_TIMEOUT);
 }
 
+/// Removes expired multi-z jobs.
+fn prune_expired_multi_jobs(jobs: &mut HashMap<u64, MultiSearchJob>) {
+    let now = Instant::now();
+    jobs.retain(|_, job| now.duration_since(job.last_touched) < IDLE_TIMEOUT);
+}
+
+/// Runs one single-z job slice and builds its response.
 fn run_job(
     mut job: SearchJob,
     job_id: u64,
@@ -692,7 +1452,43 @@ fn run_job(
     }
 }
 
+/// Runs one multi-z job slice and builds its response.
+fn run_multi_job(
+    mut job: MultiSearchJob,
+    job_id: u64,
+    pass_info: &ByondValue,
+) -> Result<(Option<MultiSearchJob>, ByondValue), NavPathError> {
+    match job.step(pass_info)? {
+        MultiJobProgress::InProgress => Ok((
+            Some(job),
+            status_response("in_progress", Some(job_id), None, None)?,
+        )),
+        MultiJobProgress::Stale => Ok((
+            None,
+            status_response("stale_topology", Some(job_id), None, None)?,
+        )),
+        MultiJobProgress::NoPath => Ok((
+            None,
+            status_response_with_actions(
+                "no_path",
+                None,
+                Some(empty_list()?),
+                Some(ByondValue::new_list()?),
+                None,
+            )?,
+        )),
+        MultiJobProgress::Found(goal) => {
+            let (path, actions) = job.final_path(goal, pass_info)?;
+            Ok((
+                None,
+                status_response_with_actions("complete", None, Some(path), Some(actions), None)?,
+            ))
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
+/// Builds a single-z search from FFI arguments.
 fn new_search_job(
     start: ByondValue,
     end: ByondValue,
@@ -769,7 +1565,37 @@ fn navmap_pathfinder_ffi(
     avoid_turf: ByondValue,
     diagonal_handling: ByondValue,
     skip_first: ByondValue,
+    allow_multiz: ByondValue,
+    max_path_cost: ByondValue,
 ) -> Result<ByondValue, NavPathError> {
+    if truthy(&allow_multiz) {
+        let Some(mut job) = new_multi_search_job(
+            start,
+            end,
+            &pass_info,
+            is_flying,
+            max_range,
+            min_target_distance,
+            simulated_only,
+            avoid_turf,
+            diagonal_handling,
+            skip_first,
+            max_path_cost,
+        )?
+        else {
+            return empty_list();
+        };
+        loop {
+            match job.step(&pass_info)? {
+                MultiJobProgress::InProgress => continue,
+                MultiJobProgress::NoPath | MultiJobProgress::Stale => return empty_list(),
+                MultiJobProgress::Found(goal) => {
+                    let (path, _) = job.final_path(goal, &pass_info)?;
+                    return Ok(path);
+                }
+            }
+        }
+    }
     let Some(mut job) = new_search_job(
         start,
         end,
@@ -794,6 +1620,7 @@ fn navmap_pathfinder_ffi(
     }
 }
 
+/// Starts a resumable native pathfinding job.
 #[allow(clippy::too_many_arguments)]
 #[byond_fn]
 #[allow(dead_code)]
@@ -808,7 +1635,40 @@ fn navmap_pathfinder_start_ffi(
     avoid_turf: ByondValue,
     diagonal_handling: ByondValue,
     skip_first: ByondValue,
+    allow_multiz: ByondValue,
+    max_path_cost: ByondValue,
 ) -> Result<ByondValue, NavPathError> {
+    let job_id = NEXT_JOB_ID.fetch_add(1, AtomicOrdering::Relaxed);
+    if truthy(&allow_multiz) {
+        let Some(job) = new_multi_search_job(
+            start,
+            end,
+            &pass_info,
+            is_flying,
+            max_range,
+            min_target_distance,
+            simulated_only,
+            avoid_turf,
+            diagonal_handling,
+            skip_first,
+            max_path_cost,
+        )?
+        else {
+            return status_response("no_path", None, Some(empty_list()?), None);
+        };
+        match run_multi_job(job, job_id, &pass_info) {
+            Ok((Some(job), response)) => {
+                let mut jobs = MULTI_SEARCH_JOBS.lock().unwrap_or_else(|p| p.into_inner());
+                prune_expired_multi_jobs(&mut jobs);
+                jobs.insert(job_id, job);
+                return Ok(response);
+            }
+            Ok((None, response)) => return Ok(response),
+            Err(error) => {
+                return status_response("error", Some(job_id), None, Some(&error.to_string()));
+            }
+        }
+    }
     let Some(job) = new_search_job(
         start,
         end,
@@ -824,7 +1684,6 @@ fn navmap_pathfinder_start_ffi(
     else {
         return status_response("no_path", None, Some(empty_list()?), None);
     };
-    let job_id = NEXT_JOB_ID.fetch_add(1, AtomicOrdering::Relaxed);
     match run_job(job, job_id, &pass_info) {
         Ok((Some(job), response)) => {
             let mut jobs = SEARCH_JOBS
@@ -839,6 +1698,7 @@ fn navmap_pathfinder_start_ffi(
     }
 }
 
+/// Resumes and returns the next result for a native pathfinding job.
 #[byond_fn]
 #[allow(dead_code)]
 fn navmap_pathfinder_resume_ffi(
@@ -860,7 +1720,25 @@ fn navmap_pathfinder_resume_ffi(
         prune_expired_jobs(&mut jobs);
         jobs.remove(&job_id)
     };
-    let Some(job) = job else {
+    if let Some(job) = job {
+        return match run_job(job, job_id, &pass_info) {
+            Ok((Some(job), response)) => {
+                SEARCH_JOBS
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert(job_id, job);
+                Ok(response)
+            }
+            Ok((None, response)) => Ok(response),
+            Err(error) => status_response("error", Some(job_id), None, Some(&error.to_string())),
+        };
+    }
+    let multi_job = {
+        let mut jobs = MULTI_SEARCH_JOBS.lock().unwrap_or_else(|p| p.into_inner());
+        prune_expired_multi_jobs(&mut jobs);
+        jobs.remove(&job_id)
+    };
+    let Some(job) = multi_job else {
         return status_response(
             "error",
             Some(job_id),
@@ -868,11 +1746,11 @@ fn navmap_pathfinder_resume_ffi(
             Some("unknown or expired navmap pathfinder job"),
         );
     };
-    match run_job(job, job_id, &pass_info) {
+    match run_multi_job(job, job_id, &pass_info) {
         Ok((Some(job), response)) => {
-            SEARCH_JOBS
+            MULTI_SEARCH_JOBS
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .unwrap_or_else(|p| p.into_inner())
                 .insert(job_id, job);
             Ok(response)
         }
@@ -881,6 +1759,7 @@ fn navmap_pathfinder_resume_ffi(
     }
 }
 
+/// Cancels an active native pathfinding job.
 #[byond_fn]
 #[allow(dead_code)]
 fn navmap_pathfinder_cancel_ffi(job_id: ByondValue) -> Result<ByondValue, NavPathError> {
@@ -899,6 +1778,14 @@ fn navmap_pathfinder_cancel_ffi(job_id: ByondValue) -> Result<ByondValue, NavPat
         prune_expired_jobs(&mut jobs);
         jobs.remove(&job_id).is_some()
     };
+    let removed_multi = if removed {
+        false
+    } else {
+        let mut jobs = MULTI_SEARCH_JOBS.lock().unwrap_or_else(|p| p.into_inner());
+        prune_expired_multi_jobs(&mut jobs);
+        jobs.remove(&job_id).is_some()
+    };
+    let removed = removed || removed_multi;
     status_response(
         if removed { "cancelled" } else { "error" },
         Some(job_id),
@@ -907,6 +1794,7 @@ fn navmap_pathfinder_cancel_ffi(job_id: ByondValue) -> Result<ByondValue, NavPat
     )
 }
 
+/// Updates one cached turf's packed navmap value.
 #[byond_fn]
 #[allow(dead_code)]
 fn navmap_update_ffi(
@@ -923,6 +1811,7 @@ fn navmap_update_ffi(
     Ok(ByondValue::NULL)
 }
 
+/// Updates cached packed values for a batch of turfs.
 #[byond_fn]
 #[allow(dead_code)]
 fn navmap_bulk_update_ffi(flat_list: ByondValue) -> Result<ByondValue, NavPathError> {
@@ -940,6 +1829,97 @@ fn navmap_bulk_update_ffi(flat_list: ByondValue) -> Result<ByondValue, NavPathEr
     Ok(ByondValue::NULL)
 }
 
+/// Replaces the native multi-z topology snapshot.
+#[byond_fn]
+#[allow(dead_code)]
+fn navmap_topology_update_ffi(
+    generation: ByondValue,
+    flat_list: ByondValue,
+) -> Result<ByondValue, NavPathError> {
+    let values = flat_list.read_list()?;
+    if !values.len().is_multiple_of(3) {
+        return Err(NavPathError::InvalidBulkUpdateLength);
+    }
+    let mut topology = Topology {
+        generation: generation.get_number().unwrap_or(0.0).max(0.0) as u64,
+        ..Topology::default()
+    };
+    for entry in values.chunks_exact(3) {
+        let group = entry[0].get_number()? as i32;
+        let layer = entry[1].get_number()? as i16;
+        let z = entry[2].get_number()? as i16;
+        topology
+            .z_to_layer
+            .insert(z, LayerLocation { group, layer });
+        topology.layer_to_z.insert((group, layer), z);
+    }
+    *TOPOLOGY.lock().unwrap_or_else(|p| p.into_inner()) = topology;
+    Ok(ByondValue::new_num((values.len() / 3) as f32))
+}
+
+/// Returns native topology and link cache sizes for diagnostics.
+#[byond_fn]
+#[allow(dead_code)]
+fn navmap_pathfinder_state_ffi() -> Result<ByondValue, NavPathError> {
+    let topology = TOPOLOGY.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    let links = NAV_LINKS.lock().unwrap_or_else(|p| p.into_inner()).len();
+    let mut result = ByondValue::new_list()?;
+    result.write_list_index(
+        ByondValue::new_string("generation"),
+        ByondValue::new_num(topology.generation as f32),
+    )?;
+    result.write_list_index(
+        ByondValue::new_string("z_count"),
+        ByondValue::new_num(topology.z_to_layer.len() as f32),
+    )?;
+    result.write_list_index(
+        ByondValue::new_string("layer_count"),
+        ByondValue::new_num(topology.layer_to_z.len() as f32),
+    )?;
+    result.write_list_index(
+        ByondValue::new_string("link_count"),
+        ByondValue::new_num(links as f32),
+    )?;
+    Ok(result)
+}
+
+/// Replaces the native cross-z navigation links.
+#[byond_fn]
+#[allow(dead_code)]
+fn navmap_links_update_ffi(flat_list: ByondValue) -> Result<ByondValue, NavPathError> {
+    let values = flat_list.read_list()?;
+    if !values.len().is_multiple_of(8) {
+        return Err(NavPathError::InvalidBulkUpdateLength);
+    }
+    let mut links = NAV_LINKS.lock().unwrap_or_else(|p| p.into_inner());
+    links.clear();
+    for entry in values.chunks_exact(8) {
+        let id = entry[0].get_number()?.max(0.0) as u64;
+        let source = (
+            entry[1].get_number()? as i16,
+            entry[2].get_number()? as i16,
+            entry[3].get_number()? as i16,
+        );
+        let destination = (
+            entry[4].get_number()? as i16,
+            entry[5].get_number()? as i16,
+            entry[6].get_number()? as i16,
+        );
+        let cost = entry[7].get_number()?.max(1.0) as u32;
+        links.insert(
+            id,
+            NavLink {
+                id,
+                source,
+                destination,
+                cost,
+            },
+        );
+    }
+    Ok(ByondValue::new_num(links.len() as f32))
+}
+
+/// Converts separate DM coordinates into a turf tuple.
 fn coords_from_values(
     x: &ByondValue,
     y: &ByondValue,
@@ -956,6 +1936,7 @@ fn coords_from_values(
 mod tests {
     use super::*;
 
+    /// Packed cache values survive invalidation updates.
     #[test]
     fn cache_retains_simulated_invalidations() {
         let coords = (i16::MIN, i16::MIN, i16::MIN);
@@ -968,6 +1949,7 @@ mod tests {
         assert_eq!(cached_nav_pass(coords), Some(0));
     }
 
+    /// Range, space, and avoidance helpers reject invalid targets.
     #[test]
     fn option_helpers_cover_target_range_space_and_avoidance() {
         assert!(chebyshev_distance((7, 7), (10, 10)) <= 3);
@@ -977,6 +1959,7 @@ mod tests {
         assert!(!coordinate_allowed((13, 10), (10, 10), 2, None));
     }
 
+    /// Diagonal expansion preserves each requested output mode.
     #[test]
     fn path_shape_and_diagonal_modes_are_preserved() {
         let path = [(0, 0), (1, 1)];
@@ -1003,6 +1986,7 @@ mod tests {
         assert_eq!(apply_skip_first(vec![(0, 0), (1, 0)], true), vec![(1, 0)]);
     }
 
+    /// Queue ordering prefers the lowest estimated cost.
     #[test]
     fn queue_prefers_lowest_estimate() {
         let mut queue = BinaryHeap::new();
@@ -1021,6 +2005,7 @@ mod tests {
         assert_eq!(queue.pop().unwrap().coord, (1, 0));
     }
 
+    /// Creates a small job fixture with a chosen activity time.
     fn test_job(last_touched: Instant) -> SearchJob {
         let mut job = SearchJob::new(
             Grid {
@@ -1042,6 +2027,7 @@ mod tests {
         job
     }
 
+    /// Job pruning removes stale entries but keeps active ones.
     #[test]
     fn job_registry_prunes_expired_jobs_without_affecting_active_jobs() {
         let now = Instant::now();
