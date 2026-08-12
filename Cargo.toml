@@ -20,7 +20,9 @@ debug = true
 [dependencies]
 meowtonin = "0.3.3"
 thiserror = "2.0"
+tracy-client = { version = "0.18.4", optional = true, default-features = false, features = ["enable", "ondemand", "only-localhost", "delayed-init"] }
 
 [features]
 default = []
 allow_non_32bit = []
+tracy = ["dep:tracy-client"]

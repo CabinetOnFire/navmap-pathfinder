@@ -37,6 +37,24 @@
             "group": "build"
         },
         {
+            "label": "navmap-pathfinder: build (win32 Tracy)",
+            "type": "process",
+            "command": "cargo",
+            "args": [
+                "build",
+                "--release",
+                "--locked",
+                "--target",
+                "i686-pc-windows-msvc",
+                "--features",
+                "tracy"
+            ],
+            "problemMatcher": [
+                "$rustc"
+            ],
+            "group": "build"
+        },
+        {
             "label": "navmap-pathfinder: build (linux32)",
             "type": "process",
             "command": "cross",

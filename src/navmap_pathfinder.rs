@@ -12,6 +12,20 @@ use std::sync::{
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
+#[cfg(feature = "tracy")]
+macro_rules! tracy_span {
+    ($name:expr) => {
+        let _tracy_span = tracy_client::span!($name);
+    };
+}
+
+#[cfg(not(feature = "tracy"))]
+macro_rules! tracy_span {
+    ($name:expr) => {
+        let _tracy_span = ();
+    };
+}
+
 /// North direction bit.
 const NORTH: i32 = 1;
 /// South direction bit.
@@ -157,20 +171,49 @@ impl Grid {
         y: i16,
         pass_info: &ByondValue,
     ) -> Result<Option<TurfInfo>, NavPathError> {
+        tracy_span!("navmap.grid_lookup");
         // A search must use one consistent view of each turf, even if it yields and resumes.
         if let Some(hit) = self.cache.get(&(x, y)) {
             return Ok(*hit);
         }
 
-        let turf = locate_xyz(ByondXYZ::new(x, y, self.z))?;
-        let entry = if turf.is_null() {
-            None
-        } else {
-            let (open_edges, nav_pass) = self.resolve_edges((x, y, self.z), &turf, pass_info)?;
-            Some(TurfInfo {
-                open_edges,
-                simulated: nav_pass_is_simulated(nav_pass),
-            })
+        let coords = (x, y, self.z);
+        let entry = match cached_nav_pass(coords) {
+            // Published baked data is authoritative for unconditional edges. Avoid crossing
+            // the BYOND FFI for the overwhelmingly common static-map case.
+            Some(nav_pass) if nav_pass & BAKED_FLAG != 0 => {
+                if let Some((open_edges, _)) = cached_unconditional_edges(nav_pass, self.is_flying)
+                {
+                    Some(TurfInfo {
+                        open_edges,
+                        simulated: nav_pass_is_simulated(nav_pass),
+                    })
+                } else {
+                    let turf = locate_xyz(ByondXYZ::new(x, y, self.z))?;
+                    if turf.is_null() {
+                        None
+                    } else {
+                        let (open_edges, nav_pass) =
+                            self.resolve_edges(coords, &turf, pass_info)?;
+                        Some(TurfInfo {
+                            open_edges,
+                            simulated: nav_pass_is_simulated(nav_pass),
+                        })
+                    }
+                }
+            }
+            _ => {
+                let turf = locate_xyz(ByondXYZ::new(x, y, self.z))?;
+                if turf.is_null() {
+                    None
+                } else {
+                    let (open_edges, nav_pass) = self.resolve_edges(coords, &turf, pass_info)?;
+                    Some(TurfInfo {
+                        open_edges,
+                        simulated: nav_pass_is_simulated(nav_pass),
+                    })
+                }
+            }
         };
         self.cache.insert((x, y), entry);
         Ok(entry)
@@ -217,6 +260,7 @@ impl Grid {
         dir: i32,
         pass_info: &ByondValue,
     ) -> Result<bool, NavPathError> {
+        tracy_span!("navmap.conditional_edge");
         let blockers_list: ByondValue = turf.read_var("nav_blockers")?;
         if blockers_list.is_null() {
             return Ok(true);
@@ -350,6 +394,7 @@ impl Grid {
         from: Coord,
         pass_info: &ByondValue,
     ) -> Result<Vec<(Coord, u32)>, NavPathError> {
+        tracy_span!("navmap.grid_successors");
         let Some(source) = self.lookup(from.0, from.1, pass_info)? else {
             return Ok(Vec::new());
         };
@@ -442,6 +487,7 @@ impl SearchJob {
         diagonal_handling: DiagonalHandling,
         skip_first: bool,
     ) -> Self {
+        tracy_span!("navmap.portal_heuristic_build");
         Self {
             grid,
             goal,
@@ -597,6 +643,172 @@ enum LayeredAction {
     Link(u64),
 }
 
+/// A lower-bound route model for multi-z A*.
+///
+/// The model deliberately ignores walls, conditional blockers, and mover-specific link
+/// eligibility. It therefore cannot overestimate the real graph, while the portal nodes let it
+/// account for useful cross-z links instead of collapsing the heuristic to zero everywhere.
+struct PortalHeuristic {
+    goal: LayeredNode,
+    min_target_distance: i32,
+    is_flying: bool,
+    /// Relaxed distance from each link source to the target region.
+    source_distances: Vec<(LayeredNode, u32)>,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct RelaxedQueueEntry {
+    node: LayeredNode,
+    cost: u32,
+    sequence: u64,
+}
+
+impl Ord for RelaxedQueueEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .cost
+            .cmp(&self.cost)
+            .then_with(|| other.sequence.cmp(&self.sequence))
+    }
+}
+
+impl PartialOrd for RelaxedQueueEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PortalHeuristic {
+    fn new(
+        topology: &Topology,
+        goal: LayeredNode,
+        min_target_distance: i32,
+        is_flying: bool,
+        links: &[NavLink],
+    ) -> Self {
+        let mut portals = vec![goal];
+        for link in links {
+            if let (Some(source), Some(destination)) = (
+                node_for_xyz(topology, link.source.0, link.source.1, link.source.2),
+                node_for_xyz(
+                    topology,
+                    link.destination.0,
+                    link.destination.1,
+                    link.destination.2,
+                ),
+            ) {
+                if !portals.contains(&source) {
+                    portals.push(source);
+                }
+                if !portals.contains(&destination) {
+                    portals.push(destination);
+                }
+            }
+        }
+
+        // Reverse Dijkstra over the relaxed portal graph. Geometric movement is represented as a
+        // complete graph between portals; links add directed weighted edges.
+        let mut distances = HashMap::new();
+        let mut frontier = BinaryHeap::new();
+        let mut sequence = 0;
+        for &portal in &portals {
+            if let Some(cost) = relaxed_distance(portal, goal, min_target_distance, is_flying) {
+                if distances.get(&portal).is_none_or(|&old| cost < old) {
+                    distances.insert(portal, cost);
+                    sequence += 1;
+                    frontier.push(RelaxedQueueEntry {
+                        node: portal,
+                        cost,
+                        sequence,
+                    });
+                }
+            }
+        }
+
+        while let Some(current) = frontier.pop() {
+            if distances.get(&current.node).copied() != Some(current.cost) {
+                continue;
+            }
+            for &candidate in &portals {
+                let Some(edge_cost) = relaxed_distance(candidate, current.node, 0, is_flying)
+                else {
+                    continue;
+                };
+                let candidate_cost = current.cost.saturating_add(edge_cost);
+                if distances
+                    .get(&candidate)
+                    .is_none_or(|&old| candidate_cost < old)
+                {
+                    distances.insert(candidate, candidate_cost);
+                    sequence += 1;
+                    frontier.push(RelaxedQueueEntry {
+                        node: candidate,
+                        cost: candidate_cost,
+                        sequence,
+                    });
+                }
+            }
+            for link in links {
+                let Some(destination) = node_for_xyz(
+                    topology,
+                    link.destination.0,
+                    link.destination.1,
+                    link.destination.2,
+                ) else {
+                    continue;
+                };
+                if destination != current.node {
+                    continue;
+                }
+                let Some(source) =
+                    node_for_xyz(topology, link.source.0, link.source.1, link.source.2)
+                else {
+                    continue;
+                };
+                let candidate_cost = current.cost.saturating_add(link.cost);
+                if distances
+                    .get(&source)
+                    .is_none_or(|&old| candidate_cost < old)
+                {
+                    distances.insert(source, candidate_cost);
+                    sequence += 1;
+                    frontier.push(RelaxedQueueEntry {
+                        node: source,
+                        cost: candidate_cost,
+                        sequence,
+                    });
+                }
+            }
+        }
+
+        let source_distances = links
+            .iter()
+            .filter_map(|link| {
+                let source = node_for_xyz(topology, link.source.0, link.source.1, link.source.2)?;
+                Some((source, distances.get(&source).copied()?))
+            })
+            .collect();
+        Self {
+            goal,
+            min_target_distance,
+            is_flying,
+            source_distances,
+        }
+    }
+
+    fn estimate(&self, node: LayeredNode) -> u32 {
+        let mut best = relaxed_distance(node, self.goal, self.min_target_distance, self.is_flying)
+            .unwrap_or(0);
+        for &(source, distance) in &self.source_distances {
+            let Some(to_source) = relaxed_distance(node, source, 0, self.is_flying) else {
+                continue;
+            };
+            best = best.min(to_source.saturating_add(distance));
+        }
+        best
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 /// Queue entry for multi-z A*.
 struct LayeredQueueEntry {
@@ -604,16 +816,19 @@ struct LayeredQueueEntry {
     node: LayeredNode,
     /// Cost already spent reaching the node.
     cost: u32,
+    /// Cost plus the relaxed lower-bound estimate.
+    estimate: u32,
     /// Tie-breaker preserving queue order.
     sequence: u64,
 }
 
 impl Ord for LayeredQueueEntry {
-    /// Orders entries by lowest cost first.
+    /// Orders entries by lowest estimated total cost first.
     fn cmp(&self, other: &Self) -> Ordering {
         other
-            .cost
-            .cmp(&self.cost)
+            .estimate
+            .cmp(&self.estimate)
+            .then_with(|| other.cost.cmp(&self.cost))
             .then_with(|| other.sequence.cmp(&self.sequence))
     }
 }
@@ -643,6 +858,8 @@ struct LayeredGrid {
     simulated_only: bool,
     /// Optional node excluded from the search.
     avoid: Option<LayeredNode>,
+    /// Cross-z links indexed by their source turf for O(out-degree) expansion.
+    links_by_source: HashMap<TurfCoords, Vec<NavLink>>,
     /// Cached node lookups.
     cache: HashMap<LayeredNode, Option<TurfInfo>>,
 }
@@ -662,6 +879,7 @@ impl LayeredGrid {
         node: LayeredNode,
         pass_info: &ByondValue,
     ) -> Result<Option<TurfInfo>, NavPathError> {
+        tracy_span!("navmap.layered_lookup");
         if let Some(hit) = self.cache.get(&node) {
             return Ok(*hit);
         }
@@ -669,20 +887,43 @@ impl LayeredGrid {
             self.cache.insert(node, None);
             return Ok(None);
         };
-        let turf = locate_xyz(ByondXYZ::new(node.x, node.y, z))?;
-        let entry = if turf.is_null() {
-            None
-        } else {
-            let (open_edges, vertical_open, nav_pass) =
-                self.resolve_edges((node.x, node.y, z), &turf, pass_info)?;
-            Some(TurfInfo {
-                open_edges,
-                simulated: nav_pass_is_simulated(nav_pass),
-            })
-            .map(|info| TurfInfo {
-                open_edges: info.open_edges | (vertical_open << 24),
-                ..info
-            })
+        let coords = (node.x, node.y, z);
+        let entry = match cached_nav_pass(coords) {
+            Some(nav_pass) if nav_pass & BAKED_FLAG != 0 => {
+                if let Some((open_edges, vertical_open)) =
+                    cached_unconditional_edges(nav_pass, self.is_flying)
+                {
+                    Some(TurfInfo {
+                        open_edges: open_edges | (vertical_open << 24),
+                        simulated: nav_pass_is_simulated(nav_pass),
+                    })
+                } else {
+                    let turf = locate_xyz(ByondXYZ::new(node.x, node.y, z))?;
+                    if turf.is_null() {
+                        None
+                    } else {
+                        let (open_edges, vertical_open, nav_pass) =
+                            self.resolve_edges(coords, &turf, pass_info)?;
+                        Some(TurfInfo {
+                            open_edges: open_edges | (vertical_open << 24),
+                            simulated: nav_pass_is_simulated(nav_pass),
+                        })
+                    }
+                }
+            }
+            _ => {
+                let turf = locate_xyz(ByondXYZ::new(node.x, node.y, z))?;
+                if turf.is_null() {
+                    None
+                } else {
+                    let (open_edges, vertical_open, nav_pass) =
+                        self.resolve_edges(coords, &turf, pass_info)?;
+                    Some(TurfInfo {
+                        open_edges: open_edges | (vertical_open << 24),
+                        simulated: nav_pass_is_simulated(nav_pass),
+                    })
+                }
+            }
         };
         self.cache.insert(node, entry);
         Ok(entry)
@@ -818,6 +1059,7 @@ impl LayeredGrid {
         from: LayeredNode,
         pass_info: &ByondValue,
     ) -> Result<Vec<(LayeredNode, u32, LayeredAction)>, NavPathError> {
+        tracy_span!("navmap.layered_successors");
         let Some(source) = self.lookup(from, pass_info)? else {
             return Ok(Vec::new());
         };
@@ -853,32 +1095,36 @@ impl LayeredGrid {
                 }
             }
         }
-        let links = NAV_LINKS.lock().unwrap_or_else(|p| p.into_inner()).clone();
         let Some(source_z) = self.z_for(from) else {
             return Ok(out);
         };
-        for link in links
-            .values()
-            .filter(|link| link.source == (from.x, from.y, source_z))
+        if let Some(links) = self
+            .links_by_source
+            .get(&(from.x, from.y, source_z))
+            .cloned()
         {
-            let Some(destination_layer) = self.topology.z_to_layer.get(&link.destination.2) else {
-                continue;
-            };
-            let to = LayeredNode {
-                group: destination_layer.group,
-                layer: destination_layer.layer,
-                x: link.destination.0,
-                y: link.destination.1,
-            };
-            if !self.can_occupy(to, pass_info)? {
-                continue;
-            }
-            let allowed: ByondValue = call_global(
-                "navmap_pathfinder_link_can_plan",
-                [ByondValue::new_num(link.id as f32), pass_info.clone()],
-            )?;
-            if truthy(&allowed) {
-                out.push((to, link.cost, LayeredAction::Link(link.id)));
+            for link in links {
+                let Some(destination_layer) = self.topology.z_to_layer.get(&link.destination.2)
+                else {
+                    continue;
+                };
+                let to = LayeredNode {
+                    group: destination_layer.group,
+                    layer: destination_layer.layer,
+                    x: link.destination.0,
+                    y: link.destination.1,
+                };
+                if !self.can_occupy(to, pass_info)? {
+                    continue;
+                }
+                tracy_span!("navmap.link_can_plan");
+                let allowed: ByondValue = call_global(
+                    "navmap_pathfinder_link_can_plan",
+                    [ByondValue::new_num(link.id as f32), pass_info.clone()],
+                )?;
+                if truthy(&allowed) {
+                    out.push((to, link.cost, LayeredAction::Link(link.id)));
+                }
             }
         }
         Ok(out)
@@ -899,6 +1145,8 @@ struct MultiSearchJob {
     grid: LayeredGrid,
     /// Search target node.
     goal: LayeredNode,
+    /// Admissible lower-bound estimate including cross-z portals.
+    heuristic: PortalHeuristic,
     /// Acceptable distance from the target.
     min_target_distance: i32,
     /// Requested diagonal output mode.
@@ -922,6 +1170,7 @@ struct MultiSearchJob {
 impl MultiSearchJob {
     /// Advances the search for one time slice.
     fn step(&mut self, pass_info: &ByondValue) -> Result<MultiJobProgress, NavPathError> {
+        tracy_span!("navmap.multi_search_step");
         self.last_touched = Instant::now();
         if topology_generation() != self.grid.topology.generation {
             return Ok(MultiJobProgress::Stale);
@@ -969,6 +1218,7 @@ impl MultiSearchJob {
         self.frontier.push(LayeredQueueEntry {
             node,
             cost,
+            estimate: cost.saturating_add(self.heuristic.estimate(node)),
             sequence: self.sequence,
         });
     }
@@ -1088,6 +1338,7 @@ fn evaluate_conditional_edge(
     pass_flags: i32,
     pass_info: &ByondValue,
 ) -> Result<bool, NavPathError> {
+    tracy_span!("navmap.conditional_edge_multiz");
     let blockers_list: ByondValue = turf.read_var("nav_blockers")?;
     if blockers_list.is_null() {
         return Ok(true);
@@ -1167,19 +1418,38 @@ fn new_multi_search_job(
         .and_then(|value| value.get_number())
         .map(|number| number as i32)
         .unwrap_or(0);
+    let links: Vec<NavLink> = NAV_LINKS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .values()
+        .copied()
+        .collect();
+    let mut links_by_source: HashMap<TurfCoords, Vec<NavLink>> = HashMap::new();
+    for link in &links {
+        links_by_source.entry(link.source).or_default().push(*link);
+    }
+    let is_flying = truthy(&is_flying);
     Ok(Some(MultiSearchJob {
         grid: LayeredGrid {
             topology: topology.clone(),
             pass_flags,
-            is_flying: truthy(&is_flying),
+            is_flying,
             start: start_node,
             max_range,
             max_cost: max_path_cost,
             simulated_only: truthy(&simulated_only),
             avoid,
+            links_by_source,
             cache: HashMap::new(),
         },
         goal: goal_node,
+        heuristic: PortalHeuristic::new(
+            &topology,
+            goal_node,
+            min_target_distance,
+            is_flying,
+            &links,
+        ),
         min_target_distance,
         diagonal_handling: DiagonalHandling::from_byond(&diagonal_handling),
         skip_first: truthy(&skip_first),
@@ -1199,6 +1469,37 @@ fn cached_nav_pass(coords: TurfCoords) -> Option<i32> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .get(&coords)
         .copied()
+}
+
+/// Decodes cached baked edges when no live conditional blocker lookup is needed.
+///
+/// A cached value may be used without locating the turf only when none of the selected
+/// movement-class edges are conditional. Vertical edges are returned separately because the
+/// layered search stores them outside the horizontal edge bit range in `TurfInfo`.
+fn cached_unconditional_edges(nav_pass: i32, is_flying: bool) -> Option<(i32, i32)> {
+    let class_shift = if is_flying { FLYING_SHIFT } else { 0 };
+    let class_mask = CARDINALS
+        .iter()
+        .fold(0, |mask, &dir| mask | (dir << class_shift));
+    if CARDINALS
+        .iter()
+        .any(|&dir| nav_pass & (dir << class_shift) != 0 && nav_pass & (dir << COND_SHIFT) != 0)
+    {
+        return None;
+    }
+    let open = (nav_pass & class_mask) >> class_shift;
+    let vertical = if is_flying {
+        let vertical_mask = (UP | DOWN) << FLYING_SHIFT;
+        if [UP, DOWN].iter().any(|&dir| {
+            nav_pass & (dir << FLYING_SHIFT) != 0 && nav_pass & (dir << COND_SHIFT) != 0
+        }) {
+            return None;
+        }
+        (nav_pass & vertical_mask) >> FLYING_SHIFT
+    } else {
+        0
+    };
+    Some((open, vertical))
 }
 
 /// Stores one packed navmap value in the shared cache.
@@ -1264,6 +1565,27 @@ fn heuristic_to_target_range(coord: Coord, goal: Coord, target_distance: i32) ->
     let dx = ((coord.0 - goal.0).unsigned_abs() as i32 - target_distance).max(0) as u32;
     let dy = ((coord.1 - goal.1).unsigned_abs() as i32 - target_distance).max(0) as u32;
     14 * dx.min(dy) + 10 * dx.abs_diff(dy)
+}
+
+/// Returns a relaxed lower-bound cost between layered nodes.
+fn relaxed_distance(
+    from: LayeredNode,
+    to: LayeredNode,
+    target_distance: i32,
+    is_flying: bool,
+) -> Option<u32> {
+    if from.group != to.group || (!is_flying && from.layer != to.layer) {
+        return None;
+    }
+    let dx = ((from.x - to.x).unsigned_abs() as i32 - target_distance).max(0) as u32;
+    let dy = ((from.y - to.y).unsigned_abs() as i32 - target_distance).max(0) as u32;
+    let horizontal = 14 * dx.min(dy) + 10 * dx.abs_diff(dy);
+    let vertical = if is_flying {
+        from.layer.abs_diff(to.layer) as u32 * 10
+    } else {
+        0
+    };
+    Some(horizontal.saturating_add(vertical))
 }
 
 #[cfg(test)]
@@ -1568,6 +1890,7 @@ fn navmap_pathfinder_ffi(
     allow_multiz: ByondValue,
     max_path_cost: ByondValue,
 ) -> Result<ByondValue, NavPathError> {
+    tracy_span!("navmap.pathfinder_blocking");
     if truthy(&allow_multiz) {
         let Some(mut job) = new_multi_search_job(
             start,
@@ -1638,6 +1961,7 @@ fn navmap_pathfinder_start_ffi(
     allow_multiz: ByondValue,
     max_path_cost: ByondValue,
 ) -> Result<ByondValue, NavPathError> {
+    tracy_span!("navmap.pathfinder_start");
     let job_id = NEXT_JOB_ID.fetch_add(1, AtomicOrdering::Relaxed);
     if truthy(&allow_multiz) {
         let Some(job) = new_multi_search_job(
@@ -1705,6 +2029,7 @@ fn navmap_pathfinder_resume_ffi(
     job_id: ByondValue,
     pass_info: ByondValue,
 ) -> Result<ByondValue, NavPathError> {
+    tracy_span!("navmap.pathfinder_resume");
     let Some(job_id) = parse_job_id(&job_id) else {
         return status_response(
             "error",
