@@ -701,16 +701,16 @@ impl PortalHeuristic {
         let mut frontier = BinaryHeap::new();
         let mut sequence = 0;
         for &portal in &portals {
-            if let Some(cost) = relaxed_distance(portal, goal, min_target_distance, is_flying) {
-                if distances.get(&portal).is_none_or(|&old| cost < old) {
-                    distances.insert(portal, cost);
-                    sequence += 1;
-                    frontier.push(RelaxedQueueEntry {
-                        node: portal,
-                        cost,
-                        sequence,
-                    });
-                }
+            if let Some(cost) = relaxed_distance(portal, goal, min_target_distance, is_flying)
+                && distances.get(&portal).is_none_or(|&old| cost < old)
+            {
+                distances.insert(portal, cost);
+                sequence += 1;
+                frontier.push(RelaxedQueueEntry {
+                    node: portal,
+                    cost,
+                    sequence,
+                });
             }
         }
 
