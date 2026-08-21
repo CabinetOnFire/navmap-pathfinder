@@ -1,5 +1,5 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
-// The exported BYOND ABI keeps the existing ten-argument pathfinder signature.
+// bro what can I say I like my args
 #![allow(clippy::too_many_arguments)]
 
 pub mod navmap_pathfinder;

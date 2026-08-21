@@ -68,11 +68,21 @@ The release workflow publishes the 64-bit files as `navmap_pathfinder64.dll`,
 Every build also creates `target/navmap_pathfinder.dm`. Include that file in the DM project
 alongside the matching library.
 
+For native search profiling, add the opt-in `tracy` feature to a diagnostic build:
+
+```powershell
+cargo build --release --target i686-pc-windows-msvc --features tracy
+```
+
+The resulting DLL exposes native zones to a Tracy client on localhost. Use the normal build
+for production; the Tracy feature is intentionally disabled by default.
+
 
 ## VS Code
 
 Press F5 and choose `Build navmap-pathfinder (win32)` for the default BYOND build. The
-`Build navmap-pathfinder (win64)`, `Build navmap-pathfinder (linux32)`, and
+`Build navmap-pathfinder (win32 Tracy)` configuration is an opt-in optimized Tracy build.
+The `Build navmap-pathfinder (win64)`, `Build navmap-pathfinder (linux32)`, and
 `Build navmap-pathfinder (linux64)` configurations are available from the launch
 configuration selector. Linux tasks use [cross](https://github.com/cross-rs/cross), which
 must be installed and requires Docker.

@@ -16,6 +16,13 @@
             "cwd": "${workspaceFolder}"
         },
         {
+            "name": "Build navmap-pathfinder (win32 Tracy)",
+            "type": "node-terminal",
+            "request": "launch",
+            "command": "cargo build --release --locked --target i686-pc-windows-msvc --features tracy",
+            "cwd": "${workspaceFolder}"
+        },
+        {
             "name": "Build navmap-pathfinder (linux32)",
             "type": "node-terminal",
             "request": "launch",
