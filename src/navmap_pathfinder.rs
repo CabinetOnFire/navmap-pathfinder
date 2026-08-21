@@ -26,28 +26,17 @@ macro_rules! tracy_span {
     };
 }
 
-/// North direction bit.
 const NORTH: i32 = 1;
-/// South direction bit.
 const SOUTH: i32 = 2;
-/// East direction bit.
 const EAST: i32 = 4;
-/// West direction bit.
 const WEST: i32 = 8;
-/// Upward direction bit.
 const UP: i32 = 1 << 4;
-/// Downward direction bit.
 const DOWN: i32 = 1 << 5;
-/// Cardinal directions considered by A*.
 const CARDINALS: [i32; 4] = [NORTH, SOUTH, EAST, WEST];
 
-/// Flying-edge bit offset.
 const FLYING_SHIFT: i32 = 6;
-/// Conditional-edge bit offset.
 const COND_SHIFT: i32 = 12;
-/// Baked-turf flag.
 const BAKED_FLAG: i32 = 1 << 18;
-/// Simulated-turf flag.
 const SIMULATED_FLAG: i32 = 1 << 19;
 
 /// DM value for preserving diagonals.
