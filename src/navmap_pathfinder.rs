@@ -254,7 +254,9 @@ impl Grid {
         if blockers_list.is_null() {
             return Ok(true);
         }
-        let entries = match blockers_list.read_list_index::<_, ByondValue>(&dir.to_string()) {
+        let entries = match blockers_list
+            .read_list_index::<_, ByondValue>(&ByondValue::new_num(dir as f32))
+        {
             Ok(value) if value.is_list() => value.read_list()?,
             _ => return Ok(true),
         };
@@ -1332,10 +1334,11 @@ fn evaluate_conditional_edge(
     if blockers_list.is_null() {
         return Ok(true);
     }
-    let entries = match blockers_list.read_list_index::<_, ByondValue>(&dir.to_string()) {
-        Ok(value) if value.is_list() => value.read_list()?,
-        _ => return Ok(true),
-    };
+    let entries =
+        match blockers_list.read_list_index::<_, ByondValue>(&ByondValue::new_num(dir as f32)) {
+            Ok(value) if value.is_list() => value.read_list()?,
+            _ => return Ok(true),
+        };
     for entry in entries {
         if entry.is_number() {
             if pass_flags & entry.get_number()? as i32 == 0 {
