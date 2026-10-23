@@ -68,6 +68,12 @@ The release workflow publishes the 64-bit files as `navmap_pathfinder64.dll`,
 Every build also creates `target/navmap_pathfinder.dm`. Include that file in the DM project
 alongside the matching library.
 
+Conditional `nav_blockers` entries use a flat list of numeric pass-flag masks and
+weakrefs. The DLL calls the source turf's
+`nav_blocker_can_pass(weakref, edge direction, pass_info)` once per weakref entry;
+DM resolves the weakref and evaluates `CanAStarPass` within that callback.
+Expired weakrefs are skipped.
+
 For native search profiling, add the opt-in `tracy` feature to a diagnostic build:
 
 ```powershell

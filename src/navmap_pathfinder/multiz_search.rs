@@ -1,132 +1,40 @@
 //! Layered topology traversal and resumable multi-z A* search.
 
+use super::search::{expand_path_diagonals, nav_link_estimate, nav_link_source_distances};
 use super::*;
 
-impl Ord for RelaxedQueueEntry {
-    fn cmp(&self, other: &Self) -> Ordering {
-        other
-            .cost
-            .cmp(&self.cost)
-            .then_with(|| other.sequence.cmp(&self.sequence))
-    }
-}
-
-impl PartialOrd for RelaxedQueueEntry {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl PortalHeuristic {
+impl NavLinkHeuristic {
     pub(super) fn new(
         topology: &Topology,
         goal: LayeredNode,
         min_target_distance: i32,
         is_flying: bool,
-        links: &[NavLink],
+        nav_links: &[NavLink],
     ) -> Self {
-        let mut portals = vec![goal];
-        for link in links {
-            if let (Some(source), Some(destination)) = (
-                node_for_xyz(topology, link.source.0, link.source.1, link.source.2),
-                node_for_xyz(
-                    topology,
-                    link.destination.0,
-                    link.destination.1,
-                    link.destination.2,
-                ),
-            ) {
-                if !portals.contains(&source) {
-                    portals.push(source);
-                }
-                if !portals.contains(&destination) {
-                    portals.push(destination);
-                }
-            }
-        }
-
-        // Reverse Dijkstra over the relaxed portal graph. Geometric movement is represented as a
-        // complete graph between portals; links add directed weighted edges.
-        let mut distances = HashMap::new();
-        let mut frontier = BinaryHeap::new();
-        let mut sequence = 0;
-        for &portal in &portals {
-            if let Some(cost) = relaxed_distance(portal, goal, min_target_distance, is_flying)
-                && distances.get(&portal).is_none_or(|&old| cost < old)
-            {
-                distances.insert(portal, cost);
-                sequence += 1;
-                frontier.push(RelaxedQueueEntry {
-                    node: portal,
-                    cost,
-                    sequence,
-                });
-            }
-        }
-
-        while let Some(current) = frontier.pop() {
-            if distances.get(&current.node).copied() != Some(current.cost) {
-                continue;
-            }
-            for &candidate in &portals {
-                let Some(edge_cost) = relaxed_distance(candidate, current.node, 0, is_flying)
-                else {
-                    continue;
-                };
-                let candidate_cost = current.cost.saturating_add(edge_cost);
-                if distances
-                    .get(&candidate)
-                    .is_none_or(|&old| candidate_cost < old)
-                {
-                    distances.insert(candidate, candidate_cost);
-                    sequence += 1;
-                    frontier.push(RelaxedQueueEntry {
-                        node: candidate,
-                        cost: candidate_cost,
-                        sequence,
-                    });
-                }
-            }
-            for link in links {
-                let Some(destination) = node_for_xyz(
-                    topology,
-                    link.destination.0,
-                    link.destination.1,
-                    link.destination.2,
-                ) else {
-                    continue;
-                };
-                if destination != current.node {
-                    continue;
-                }
-                let Some(source) =
-                    node_for_xyz(topology, link.source.0, link.source.1, link.source.2)
-                else {
-                    continue;
-                };
-                let candidate_cost = current.cost.saturating_add(link.cost);
-                if distances
-                    .get(&source)
-                    .is_none_or(|&old| candidate_cost < old)
-                {
-                    distances.insert(source, candidate_cost);
-                    sequence += 1;
-                    frontier.push(RelaxedQueueEntry {
-                        node: source,
-                        cost: candidate_cost,
-                        sequence,
-                    });
-                }
-            }
-        }
-
-        let source_distances = links
+        let edges: Vec<_> = nav_links
             .iter()
-            .filter_map(|link| {
-                let source = node_for_xyz(topology, link.source.0, link.source.1, link.source.2)?;
-                Some((source, distances.get(&source).copied()?))
+            .filter_map(|nav_link| {
+                Some((
+                    node_for_xyz(
+                        topology,
+                        nav_link.source.0,
+                        nav_link.source.1,
+                        nav_link.source.2,
+                    )?,
+                    node_for_xyz(
+                        topology,
+                        nav_link.destination.0,
+                        nav_link.destination.1,
+                        nav_link.destination.2,
+                    )?,
+                    nav_link.cost,
+                ))
             })
             .collect();
+        let source_distances =
+            nav_link_source_distances(goal, min_target_distance, &edges, |from, to, distance| {
+                relaxed_distance(from, to, distance, is_flying)
+            });
         Self {
             goal,
             min_target_distance,
@@ -136,33 +44,13 @@ impl PortalHeuristic {
     }
 
     fn estimate(&self, node: LayeredNode) -> u32 {
-        let mut best = relaxed_distance(node, self.goal, self.min_target_distance, self.is_flying)
-            .unwrap_or(0);
-        for &(source, distance) in &self.source_distances {
-            let Some(to_source) = relaxed_distance(node, source, 0, self.is_flying) else {
-                continue;
-            };
-            best = best.min(to_source.saturating_add(distance));
-        }
-        best
-    }
-}
-
-impl Ord for LayeredQueueEntry {
-    /// Orders entries by lowest estimated total cost first.
-    fn cmp(&self, other: &Self) -> Ordering {
-        other
-            .estimate
-            .cmp(&self.estimate)
-            .then_with(|| other.cost.cmp(&self.cost))
-            .then_with(|| other.sequence.cmp(&self.sequence))
-    }
-}
-
-impl PartialOrd for LayeredQueueEntry {
-    /// Delegates partial ordering to the queue ordering.
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
+        nav_link_estimate(
+            node,
+            self.goal,
+            self.min_target_distance,
+            &self.source_distances,
+            |from, to, distance| relaxed_distance(from, to, distance, self.is_flying),
+        )
     }
 }
 
@@ -247,32 +135,9 @@ impl LayeredGrid {
             }
             cache_nav_pass(coords, nav_pass);
         }
-        let mut open = 0;
-        for dir in CARDINALS {
-            if nav_pass & (dir << if self.is_flying { FLYING_SHIFT } else { 0 }) == 0 {
-                continue;
-            }
-            if nav_pass & (dir << COND_SHIFT) == 0
-                || evaluate_conditional_edge(turf, dir, self.pass_flags, pass_info)?
-            {
-                open |= dir;
-            }
-        }
-        let mut vertical = 0;
-        if self.is_flying {
-            for dir in [UP, DOWN] {
-                let nav_bit = dir << FLYING_SHIFT;
-                let cond_bit = dir << COND_SHIFT;
-                if nav_pass & nav_bit == 0 {
-                    continue;
-                }
-                if nav_pass & cond_bit == 0
-                    || evaluate_conditional_edge(turf, dir, self.pass_flags, pass_info)?
-                {
-                    vertical |= dir;
-                }
-            }
-        }
+        let (open, vertical) = resolve_packed_edges(nav_pass, self.is_flying, true, |dir| {
+            evaluate_conditional_edge(turf, dir, self.pass_flags, pass_info)
+        })?;
         Ok((open, vertical, nav_pass))
     }
 
@@ -355,12 +220,12 @@ impl LayeredGrid {
         })
     }
 
-    /// Returns horizontal, vertical, and linked successors.
+    /// Returns horizontal, vertical, and navigation-link successors.
     fn successors(
         &mut self,
         from: LayeredNode,
         pass_info: &ByondValue,
-    ) -> Result<Vec<(LayeredNode, u32, LayeredAction)>, NavPathError> {
+    ) -> Result<Vec<(LayeredNode, u32, SearchAction)>, NavPathError> {
         tracy_span!("navmap.layered_successors");
         let Some(source) = self.lookup(from, pass_info)? else {
             return Ok(Vec::new());
@@ -379,7 +244,7 @@ impl LayeredGrid {
                 routes.north_south_first || routes.east_west_first
             };
             if walkable {
-                out.push((to, cost, LayeredAction::None));
+                out.push((to, cost, SearchAction::None));
             }
         }
         if self.is_flying {
@@ -393,28 +258,31 @@ impl LayeredGrid {
                     ..from
                 };
                 if self.can_occupy(to, pass_info)? {
-                    out.push((to, 10, LayeredAction::Vertical(dir)));
+                    out.push((to, 10, SearchAction::Vertical(dir)));
                 }
             }
+        }
+        if !self.allow_nav_links {
+            return Ok(out);
         }
         let Some(source_z) = self.z_for(from) else {
             return Ok(out);
         };
-        if let Some(links) = self
-            .links_by_source
+        if let Some(nav_links) = self
+            .nav_links_by_source
             .get(&(from.x, from.y, source_z))
             .cloned()
         {
-            for link in links {
-                let Some(destination_layer) = self.topology.z_to_layer.get(&link.destination.2)
+            for nav_link in nav_links {
+                let Some(destination_layer) = self.topology.z_to_layer.get(&nav_link.destination.2)
                 else {
                     continue;
                 };
                 let to = LayeredNode {
                     group: destination_layer.group,
                     layer: destination_layer.layer,
-                    x: link.destination.0,
-                    y: link.destination.1,
+                    x: nav_link.destination.0,
+                    y: nav_link.destination.1,
                 };
                 if !self.can_occupy(to, pass_info)? {
                     continue;
@@ -422,10 +290,10 @@ impl LayeredGrid {
                 tracy_span!("navmap.link_can_plan");
                 let allowed: ByondValue = call_global(
                     "navmap_pathfinder_link_can_plan",
-                    [ByondValue::new_num(link.id as f32), pass_info.clone()],
+                    [ByondValue::new_num(nav_link.id as f32), pass_info.clone()],
                 )?;
                 if truthy(&allowed) {
-                    out.push((to, link.cost, LayeredAction::Link(link.id)));
+                    out.push((to, nav_link.cost, SearchAction::NavLink(nav_link.id)));
                 }
             }
         }
@@ -446,120 +314,55 @@ impl MultiSearchJob {
         if topology_generation() != self.grid.topology.generation {
             return Ok(MultiJobProgress::Stale);
         }
-        let started = Instant::now();
-        if !self.initialized {
-            self.initialized = true;
+        let goal = self.goal;
+        let min_target_distance = self.min_target_distance;
+        if !self.search.is_initialized() {
             if !self.grid.can_occupy(self.grid.start, pass_info)? {
                 return Ok(MultiJobProgress::NoPath);
             }
-            self.push(self.grid.start, 0);
+            let estimate = self.heuristic.estimate(self.grid.start);
+            self.search.initialize(self.grid.start, estimate);
         }
-        while started.elapsed() < SLICE_BUDGET {
-            let Some(current) = self.frontier.pop() else {
-                return Ok(MultiJobProgress::NoPath);
-            };
-            if self.costs.get(&current.node).copied() != Some(current.cost) {
-                continue;
-            }
-            if current.node.group == self.goal.group
-                && current.node.layer == self.goal.layer
-                && chebyshev_distance((current.node.x, current.node.y), (self.goal.x, self.goal.y))
-                    <= self.min_target_distance
-            {
-                return Ok(MultiJobProgress::Found(current.node));
-            }
-            for (next, movement_cost, action) in self.grid.successors(current.node, pass_info)? {
-                let next_cost = current.cost.saturating_add(movement_cost);
-                if self.grid.max_cost > 0 && next_cost > self.grid.max_cost {
-                    continue;
-                }
-                if self.costs.get(&next).is_none_or(|&old| next_cost < old) {
-                    self.previous.insert(next, (current.node, action));
-                    self.push(next, next_cost);
-                }
-            }
+        match self.search.step(
+            Some(self.grid.max_cost),
+            |node| {
+                node.group == goal.group
+                    && node.layer == goal.layer
+                    && chebyshev_distance((node.x, node.y), (goal.x, goal.y)) <= min_target_distance
+            },
+            |node| self.grid.successors(node, pass_info),
+            |node| self.heuristic.estimate(node),
+        )? {
+            SearchProgress::InProgress => Ok(MultiJobProgress::InProgress),
+            SearchProgress::NoPath => Ok(MultiJobProgress::NoPath),
+            SearchProgress::Stale => Ok(MultiJobProgress::Stale),
+            SearchProgress::Found(nodes, actions) => Ok(MultiJobProgress::Found(nodes, actions)),
         }
-        Ok(MultiJobProgress::InProgress)
-    }
-
-    /// Queues a node with its current best cost.
-    fn push(&mut self, node: LayeredNode, cost: u32) {
-        self.costs.insert(node, cost);
-        self.sequence += 1;
-        self.frontier.push(LayeredQueueEntry {
-            node,
-            cost,
-            estimate: cost.saturating_add(self.heuristic.estimate(node)),
-            sequence: self.sequence,
-        });
-    }
-
-    /// Reconstructs nodes and actions from the goal.
-    fn reconstruct(&self, mut node: LayeredNode) -> (Vec<LayeredNode>, Vec<LayeredAction>) {
-        let mut nodes = vec![node];
-        // Keep each action beside its destination while unwinding; the start
-        // node receives a sentinel after both lists are reversed.
-        let mut actions = Vec::new();
-        while let Some((previous, action)) = self.previous.get(&node).copied() {
-            nodes.push(previous);
-            actions.push(action);
-            node = previous;
-        }
-        nodes.reverse();
-        actions.reverse();
-        actions.insert(0, LayeredAction::None);
-        (nodes, actions)
     }
 
     /// Rechecks and converts a layered path to DM values.
     pub(super) fn final_path(
         &mut self,
-        goal: LayeredNode,
+        raw_nodes: Vec<LayeredNode>,
+        raw_actions: Vec<SearchAction>,
         pass_info: &ByondValue,
     ) -> Result<(ByondValue, ByondValue), NavPathError> {
-        let (raw_nodes, raw_actions) = self.reconstruct(goal);
-        let mut nodes = vec![raw_nodes[0]];
-        let mut actions = vec![LayeredAction::None];
-        for (index, next) in raw_nodes.iter().copied().enumerate().skip(1) {
-            let previous = *nodes.last().unwrap();
-            if previous.group == next.group
-                && previous.layer == next.layer
-                && previous.x != next.x
-                && previous.y != next.y
-                && matches!(raw_actions[index], LayeredAction::None)
-            {
-                let routes = self.grid.diagonal_routes(previous, next, pass_info)?;
-                let intermediate = match self.diagonal_handling {
-                    DiagonalHandling::RemoveAll if routes.north_south_first => Some(LayeredNode {
-                        x: previous.x,
-                        y: next.y,
-                        ..previous
-                    }),
-                    DiagonalHandling::RemoveAll if routes.east_west_first => Some(LayeredNode {
-                        x: next.x,
-                        y: previous.y,
-                        ..previous
-                    }),
-                    DiagonalHandling::RemoveAll => return empty_list_pair(),
-                    DiagonalHandling::RemoveClunky
-                        if !routes.north_south_first && routes.east_west_first =>
-                    {
-                        Some(LayeredNode {
-                            x: next.x,
-                            y: previous.y,
-                            ..previous
-                        })
-                    }
-                    _ => None,
-                };
-                if let Some(intermediate) = intermediate {
-                    nodes.push(intermediate);
-                    actions.push(LayeredAction::None);
-                }
-            }
-            nodes.push(next);
-            actions.push(raw_actions[index]);
-        }
+        let Some((nodes, mut actions)) = expand_path_diagonals(
+            &raw_nodes,
+            &raw_actions,
+            self.diagonal_handling,
+            |node| (node.x, node.y),
+            |node, (x, y)| LayeredNode { x, y, ..node },
+            |from, to, action| {
+                from.group == to.group
+                    && from.layer == to.layer
+                    && matches!(action, SearchAction::None)
+            },
+            |from, to| self.grid.diagonal_routes(from, to, pass_info),
+        )?
+        else {
+            return empty_list_pair();
+        };
         let mut path_values = Vec::new();
         for node in &nodes {
             let Some(z) = self.grid.z_for(*node) else {
@@ -576,15 +379,6 @@ impl MultiSearchJob {
             actions.remove(0);
         }
         let path = path_values.to_byond()?;
-        let action_values = actions
-            .into_iter()
-            .map(|action| match action {
-                LayeredAction::None => ByondValue::NULL,
-                LayeredAction::Vertical(dir) => ByondValue::new_num(dir as f32),
-                LayeredAction::Link(id) => ByondValue::new_num(-(id as f32)),
-            })
-            .collect::<Vec<_>>();
-        let action_list = action_values.to_byond()?;
-        Ok((path, action_list))
+        Ok((path, actions_to_byond(actions)?))
     }
 }

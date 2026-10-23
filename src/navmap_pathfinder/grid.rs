@@ -18,8 +18,7 @@ impl Grid {
 
         let coords = (x, y, self.z);
         let entry = match cached_nav_pass(coords) {
-            // Published baked data is authoritative for unconditional edges. Avoid crossing
-            // the BYOND FFI for the overwhelmingly common static-map case.
+            // Published baked data is authoritative for unconditional edges. Avoid crossing the BYOND FFI for the overwhelmingly common static-map case.
             Some(nav_pass) if nav_pass & BAKED_FLAG != 0 => {
                 if let Some((open_edges, _)) = cached_unconditional_edges(nav_pass, self.is_flying)
                 {
@@ -76,67 +75,10 @@ impl Grid {
             cache_nav_pass(coords, nav_pass);
         }
 
-        let class_shift = if self.is_flying { FLYING_SHIFT } else { 0 };
-        let mut open = 0;
-        for dir in CARDINALS {
-            if nav_pass & (dir << class_shift) == 0 {
-                continue;
-            }
-            // Conditional edges require a live DM blocker check.
-            if nav_pass & (dir << COND_SHIFT) == 0
-                || self.evaluate_conditional_edge(turf, dir, pass_info)?
-            {
-                open |= dir;
-            }
-        }
+        let (open, _) = resolve_packed_edges(nav_pass, self.is_flying, false, |dir| {
+            evaluate_conditional_edge(turf, dir, self.pass_flags, pass_info)
+        })?;
         Ok((open, nav_pass))
-    }
-
-    /// Checks live blockers for one conditional edge.
-    pub(super) fn evaluate_conditional_edge(
-        &self,
-        turf: &ByondValue,
-        dir: i32,
-        pass_info: &ByondValue,
-    ) -> Result<bool, NavPathError> {
-        tracy_span!("navmap.conditional_edge");
-        let blockers_list: ByondValue = turf.read_var("nav_blockers")?;
-        if blockers_list.is_null() {
-            return Ok(true);
-        }
-        let entries = match blockers_list
-            .read_list_index::<_, ByondValue>(&ByondValue::new_num(dir as f32))
-        {
-            Ok(value) if value.is_list() => value.read_list()?,
-            _ => return Ok(true),
-        };
-
-        for entry in entries {
-            if entry.is_number() {
-                // Numeric blockers encode the pass_flags needed for this edge.
-                if self.pass_flags & entry.get_number()? as i32 == 0 {
-                    return Ok(false);
-                }
-                continue;
-            }
-
-            let blocker_loc: ByondValue = entry.read_var("loc")?;
-            // Blockers are stored on the outgoing edge. A blocker on the destination
-            // therefore sees the reverse direction when deciding whether it can be crossed.
-            let eval_dir = if blocker_loc == *turf {
-                dir
-            } else {
-                reverse_dir(dir)
-            };
-            let result = entry.call(
-                "CanAStarPass",
-                &[ByondValue::new_num(eval_dir as f32), pass_info.clone()],
-            )?;
-            if !truthy(&result) {
-                return Ok(false);
-            }
-        }
-        Ok(true)
     }
 
     /// Returns cached turf data when the coordinate is occupiable.
@@ -238,7 +180,7 @@ impl Grid {
         &mut self,
         from: Coord,
         pass_info: &ByondValue,
-    ) -> Result<Vec<(Coord, u32)>, NavPathError> {
+    ) -> Result<Vec<(Coord, u32, SearchAction)>, NavPathError> {
         tracy_span!("navmap.grid_successors");
         let Some(source) = self.lookup(from.0, from.1, pass_info)? else {
             return Ok(Vec::new());
@@ -253,7 +195,23 @@ impl Grid {
                 routes.north_south_first || routes.east_west_first
             };
             if walkable {
-                out.push((to, cost));
+                out.push((to, cost, SearchAction::None));
+            }
+        }
+        if let Some(nav_links) = self.nav_links_by_source.get(&(from.0, from.1)).cloned() {
+            for nav_link in nav_links {
+                let to = (nav_link.destination.0, nav_link.destination.1);
+                if !self.can_occupy(to, pass_info)? {
+                    continue;
+                }
+                tracy_span!("navmap.link_can_plan");
+                let allowed: ByondValue = call_global(
+                    "navmap_pathfinder_link_can_plan",
+                    [ByondValue::new_num(nav_link.id as f32), pass_info.clone()],
+                )?;
+                if truthy(&allowed) {
+                    out.push((to, nav_link.cost, SearchAction::NavLink(nav_link.id)));
+                }
             }
         }
         Ok(out)

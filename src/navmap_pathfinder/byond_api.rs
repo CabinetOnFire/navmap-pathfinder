@@ -21,6 +21,7 @@ fn navmap_pathfinder_ffi(
     skip_first: ByondValue,
     allow_multiz: ByondValue,
     max_path_cost: ByondValue,
+    allow_nav_links: ByondValue,
 ) -> Result<ByondValue, NavPathError> {
     tracy_span!("navmap.pathfinder_blocking");
     if truthy(&allow_multiz) {
@@ -36,17 +37,41 @@ fn navmap_pathfinder_ffi(
             diagonal_handling,
             skip_first,
             max_path_cost,
+            allow_nav_links,
         )?
         else {
-            return empty_list();
+            return status_response_with_actions(
+                "no_path",
+                None,
+                Some(empty_list()?),
+                Some(ByondValue::new_list()?),
+                None,
+            );
         };
         loop {
             match job.step(&pass_info)? {
                 MultiJobProgress::InProgress => continue,
-                MultiJobProgress::NoPath | MultiJobProgress::Stale => return empty_list(),
-                MultiJobProgress::Found(goal) => {
-                    let (path, _) = job.final_path(goal, &pass_info)?;
-                    return Ok(path);
+                MultiJobProgress::NoPath => {
+                    return status_response_with_actions(
+                        "no_path",
+                        None,
+                        Some(empty_list()?),
+                        Some(ByondValue::new_list()?),
+                        None,
+                    );
+                }
+                MultiJobProgress::Stale => {
+                    return status_response("stale_topology", None, None, None);
+                }
+                MultiJobProgress::Found(nodes, actions) => {
+                    let (path, actions) = job.final_path(nodes, actions, &pass_info)?;
+                    return status_response_with_actions(
+                        "complete",
+                        None,
+                        Some(path),
+                        Some(actions),
+                        None,
+                    );
                 }
             }
         }
@@ -62,15 +87,41 @@ fn navmap_pathfinder_ffi(
         avoid_turf,
         diagonal_handling,
         skip_first,
+        max_path_cost,
+        allow_nav_links,
     )?
     else {
-        return empty_list();
+        return status_response_with_actions(
+            "no_path",
+            None,
+            Some(empty_list()?),
+            Some(ByondValue::new_list()?),
+            None,
+        );
     };
     loop {
         match job.step(&pass_info)? {
-            JobProgress::InProgress => continue,
-            JobProgress::NoPath => return empty_list(),
-            JobProgress::Found(nodes) => return job.final_path(nodes, &pass_info),
+            SearchProgress::InProgress => continue,
+            SearchProgress::Stale => return status_response("stale_topology", None, None, None),
+            SearchProgress::NoPath => {
+                return status_response_with_actions(
+                    "no_path",
+                    None,
+                    Some(empty_list()?),
+                    Some(ByondValue::new_list()?),
+                    None,
+                );
+            }
+            SearchProgress::Found(nodes, actions) => {
+                let (path, actions) = job.final_path(nodes, actions, &pass_info)?;
+                return status_response_with_actions(
+                    "complete",
+                    None,
+                    Some(path),
+                    Some(actions),
+                    None,
+                );
+            }
         }
     }
 }
@@ -92,6 +143,7 @@ fn navmap_pathfinder_start_ffi(
     skip_first: ByondValue,
     allow_multiz: ByondValue,
     max_path_cost: ByondValue,
+    allow_nav_links: ByondValue,
 ) -> Result<ByondValue, NavPathError> {
     tracy_span!("navmap.pathfinder_start");
     let job_id = NEXT_JOB_ID.fetch_add(1, AtomicOrdering::Relaxed);
@@ -108,6 +160,7 @@ fn navmap_pathfinder_start_ffi(
             diagonal_handling,
             skip_first,
             max_path_cost,
+            allow_nav_links,
         )?
         else {
             return status_response("no_path", None, Some(empty_list()?), None);
@@ -136,6 +189,8 @@ fn navmap_pathfinder_start_ffi(
         avoid_turf,
         diagonal_handling,
         skip_first,
+        max_path_cost,
+        allow_nav_links,
     )?
     else {
         return status_response("no_path", None, Some(empty_list()?), None);
@@ -314,12 +369,12 @@ fn navmap_topology_update_ffi(
     Ok(ByondValue::new_num((values.len() / 3) as f32))
 }
 
-/// Returns native topology and link cache sizes for diagnostics.
+/// Returns native topology and navigation-link cache sizes for diagnostics.
 #[byond_fn]
 #[allow(dead_code)]
 fn navmap_pathfinder_state_ffi() -> Result<ByondValue, NavPathError> {
     let topology = TOPOLOGY.lock().unwrap_or_else(|p| p.into_inner()).clone();
-    let links = NAV_LINKS.lock().unwrap_or_else(|p| p.into_inner()).len();
+    let nav_links = NAV_LINKS.lock().unwrap_or_else(|p| p.into_inner()).len();
     let mut result = ByondValue::new_list()?;
     result.write_list_index(
         ByondValue::new_string("generation"),
@@ -334,13 +389,13 @@ fn navmap_pathfinder_state_ffi() -> Result<ByondValue, NavPathError> {
         ByondValue::new_num(topology.layer_to_z.len() as f32),
     )?;
     result.write_list_index(
-        ByondValue::new_string("link_count"),
-        ByondValue::new_num(links as f32),
+        ByondValue::new_string("nav_link_count"),
+        ByondValue::new_num(nav_links as f32),
     )?;
     Ok(result)
 }
 
-/// Replaces the native cross-z navigation links.
+/// Replaces the native navigation-link cache.
 #[byond_fn]
 #[allow(dead_code)]
 fn navmap_links_update_ffi(flat_list: ByondValue) -> Result<ByondValue, NavPathError> {
@@ -348,8 +403,8 @@ fn navmap_links_update_ffi(flat_list: ByondValue) -> Result<ByondValue, NavPathE
     if !values.len().is_multiple_of(8) {
         return Err(NavPathError::InvalidBulkUpdateLength);
     }
-    let mut links = NAV_LINKS.lock().unwrap_or_else(|p| p.into_inner());
-    links.clear();
+    let mut nav_links = HashMap::new();
+    let mut nav_links_by_source: HashMap<TurfCoords, Vec<NavLink>> = HashMap::new();
     for entry in values.chunks_exact(8) {
         let id = entry[0].get_number()?.max(0.0) as u64;
         let source = (
@@ -363,17 +418,24 @@ fn navmap_links_update_ffi(flat_list: ByondValue) -> Result<ByondValue, NavPathE
             entry[6].get_number()? as i16,
         );
         let cost = entry[7].get_number()?.max(1.0) as u32;
-        links.insert(
+        let nav_link = NavLink {
             id,
-            NavLink {
-                id,
-                source,
-                destination,
-                cost,
-            },
-        );
+            source,
+            destination,
+            cost,
+        };
+        nav_links.insert(id, nav_link);
+        nav_links_by_source
+            .entry(source)
+            .or_default()
+            .push(nav_link);
     }
-    Ok(ByondValue::new_num(links.len() as f32))
+    let nav_link_count = nav_links.len();
+    *NAV_LINKS.lock().unwrap_or_else(|p| p.into_inner()) = nav_links;
+    *NAV_LINKS_BY_SOURCE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = nav_links_by_source;
+    Ok(ByondValue::new_num(nav_link_count as f32))
 }
 
 /// Converts separate DM coordinates into a turf tuple.

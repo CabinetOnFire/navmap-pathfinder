@@ -3,7 +3,6 @@
 
 use meowtonin::misc::locate_xyz;
 use meowtonin::{ByondError, ByondValue, ByondXYZ, ToByond, call_global};
-use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
 use std::sync::{
     LazyLock, Mutex,
@@ -30,6 +29,7 @@ mod byond_api;
 mod grid;
 mod multiz_search;
 mod search;
+use search::{AStarCore, SearchProgress};
 #[cfg(test)]
 #[path = "navmap_pathfinder/tests.rs"]
 mod tests;
@@ -87,8 +87,11 @@ static MULTI_SEARCH_JOBS: LazyLock<Mutex<HashMap<u64, MultiSearchJob>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 /// Native multi-z topology.
 static TOPOLOGY: LazyLock<Mutex<Topology>> = LazyLock::new(|| Mutex::new(Topology::default()));
-/// Registered cross-z navigation links.
+/// Registered navigation links.
 static NAV_LINKS: LazyLock<Mutex<HashMap<u64, NavLink>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+/// Registered navigation links indexed by source turf for cheap search snapshots.
+static NAV_LINKS_BY_SOURCE: LazyLock<Mutex<HashMap<TurfCoords, Vec<NavLink>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 /// Monotonic identifier source for search jobs.
 static NEXT_JOB_ID: AtomicU64 = AtomicU64::new(1);
@@ -152,49 +155,16 @@ struct Grid {
     start: Coord,
     /// Maximum horizontal search range.
     max_range: i32,
+    /// Maximum total path cost, or zero for unlimited.
+    max_cost: u32,
     /// Whether only simulated turfs are allowed.
     simulated_only: bool,
     /// Optional turf excluded from the search.
     avoid: Option<Coord>,
+    /// Same-z navigation links included in this search, indexed by source coordinate.
+    nav_links_by_source: HashMap<Coord, Vec<NavLink>>,
     /// Cached turf lookups.
     cache: HashMap<Coord, Option<TurfInfo>>,
-}
-
-#[derive(Clone, Copy, Eq, PartialEq)]
-struct QueueEntry {
-    /// Turf represented by this queue entry.
-    coord: Coord,
-    /// Cost already spent reaching the turf.
-    cost: u32,
-    /// Cost plus the heuristic estimate.
-    estimate: u32,
-    /// Tie-breaker preserving queue order.
-    sequence: u64,
-}
-
-impl Ord for QueueEntry {
-    /// Orders entries by lowest estimated path cost.
-    fn cmp(&self, other: &Self) -> Ordering {
-        other
-            .estimate
-            .cmp(&self.estimate)
-            .then_with(|| other.cost.cmp(&self.cost))
-            .then_with(|| other.sequence.cmp(&self.sequence))
-    }
-}
-
-impl PartialOrd for QueueEntry {
-    /// Delegates partial ordering to the total queue ordering.
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-/// Result of one single-z search slice.
-enum JobProgress {
-    InProgress,
-    Found(Vec<Coord>),
-    NoPath,
 }
 
 /// Resumable single-z A* search state.
@@ -209,16 +179,12 @@ struct SearchJob {
     diagonal_handling: DiagonalHandling,
     /// Whether the first returned turf is omitted.
     skip_first: bool,
-    /// Frontier ordered by estimated total cost.
-    frontier: BinaryHeap<QueueEntry>,
-    /// Best known cost for each visited turf.
-    costs: HashMap<Coord, u32>,
-    /// Previous turf for path reconstruction.
-    previous: HashMap<Coord, Coord>,
-    /// Whether the start node has been queued.
-    initialized: bool,
-    /// Sequence used to break queue ties.
-    sequence: u64,
+    /// Shared A* frontier, relaxation, and reconstruction state.
+    search: AStarCore<Coord>,
+    /// Topology generation for the same-z navigation-link snapshot, when links were included.
+    topology_generation: Option<u64>,
+    /// Navigation-link lower bound for routes that may use same-z links.
+    heuristic: Option<FlatNavLinkHeuristic>,
     /// Last time this job was resumed.
     last_touched: Instant,
 }
@@ -244,9 +210,9 @@ struct Topology {
 }
 
 #[derive(Clone, Copy, Debug)]
-/// A reusable cross-z transition.
+/// A reusable navigation transition.
 struct NavLink {
-    /// Stable link identifier.
+    /// Stable navigation-link identifier.
     id: u64,
     /// Link source turf.
     source: TurfCoords,
@@ -269,45 +235,33 @@ struct LayeredNode {
     y: i16,
 }
 
-#[derive(Clone, Copy, Debug)]
-/// Action used to reach a multi-z node.
-enum LayeredAction {
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+/// Action used to reach a search node.
+enum SearchAction {
+    #[default]
     None,
     Vertical(i32),
-    Link(u64),
+    NavLink(u64),
 }
 
 /// A lower-bound route model for multi-z A*.
 ///
 /// The model deliberately ignores walls, conditional blockers, and mover-specific link
-/// eligibility. It therefore cannot overestimate the real graph, while the portal nodes let it
-/// account for useful cross-z links instead of collapsing the heuristic to zero everywhere.
-struct PortalHeuristic {
+/// eligibility. It therefore cannot overestimate the real graph, while link nodes let it account
+/// for useful cross-z links instead of collapsing the heuristic to zero everywhere.
+struct NavLinkHeuristic {
     goal: LayeredNode,
     min_target_distance: i32,
     is_flying: bool,
-    /// Relaxed distance from each link source to the target region.
+    /// Relaxed distance from each navigation-link source to the target region.
     source_distances: Vec<(LayeredNode, u32)>,
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
-struct RelaxedQueueEntry {
-    node: LayeredNode,
-    cost: u32,
-    sequence: u64,
-}
-
-/// Queue entry for multi-z A*.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct LayeredQueueEntry {
-    /// Node represented by this queue entry.
-    node: LayeredNode,
-    /// Cost already spent reaching the node.
-    cost: u32,
-    /// Cost plus the relaxed lower-bound estimate.
-    estimate: u32,
-    /// Tie-breaker preserving queue order.
-    sequence: u64,
+/// Same-z navigation-link lower bound, built only when the requested floor has links.
+struct FlatNavLinkHeuristic {
+    goal: Coord,
+    min_target_distance: i32,
+    source_distances: Vec<(Coord, u32)>,
 }
 
 /// Multi-z search grid and its per-job cache.
@@ -318,6 +272,8 @@ struct LayeredGrid {
     pass_flags: i32,
     /// Whether flying edges should be used.
     is_flying: bool,
+    /// Whether registered navigation links may be traversed.
+    allow_nav_links: bool,
     /// Search origin node.
     start: LayeredNode,
     /// Maximum horizontal search range.
@@ -328,15 +284,15 @@ struct LayeredGrid {
     simulated_only: bool,
     /// Optional node excluded from the search.
     avoid: Option<LayeredNode>,
-    /// Cross-z links indexed by their source turf for O(out-degree) expansion.
-    links_by_source: HashMap<TurfCoords, Vec<NavLink>>,
+    /// Cross-z navigation links indexed by their source turf for O(out-degree) expansion.
+    nav_links_by_source: HashMap<TurfCoords, Vec<NavLink>>,
     /// Cached node lookups.
     cache: HashMap<LayeredNode, Option<TurfInfo>>,
 }
 
 enum MultiJobProgress {
     InProgress,
-    Found(LayeredNode),
+    Found(Vec<LayeredNode>, Vec<SearchAction>),
     NoPath,
     Stale,
 }
@@ -347,24 +303,16 @@ struct MultiSearchJob {
     grid: LayeredGrid,
     /// Search target node.
     goal: LayeredNode,
-    /// Admissible lower-bound estimate including cross-z portals.
-    heuristic: PortalHeuristic,
+    /// Admissible lower-bound estimate including cross-z navigation links.
+    heuristic: NavLinkHeuristic,
     /// Acceptable distance from the target.
     min_target_distance: i32,
     /// Requested diagonal output mode.
     diagonal_handling: DiagonalHandling,
     /// Whether the first returned turf is omitted.
     skip_first: bool,
-    /// Frontier ordered by path cost.
-    frontier: BinaryHeap<LayeredQueueEntry>,
-    /// Best known cost for each visited node.
-    costs: HashMap<LayeredNode, u32>,
-    /// Previous node and action for reconstruction.
-    previous: HashMap<LayeredNode, (LayeredNode, LayeredAction)>,
-    /// Whether the start node has been queued.
-    initialized: bool,
-    /// Sequence used to break queue ties.
-    sequence: u64,
+    /// Shared A* frontier, relaxation, and reconstruction state.
+    search: AStarCore<LayeredNode>,
     /// Last time this job was resumed.
     last_touched: Instant,
 }
@@ -382,40 +330,38 @@ fn topology_generation() -> u64 {
         .generation
 }
 
-/// Evaluates live blockers for one packed edge.
+/// Evaluates numeric masks and live weakrefs for one packed edge.
 fn evaluate_conditional_edge(
     turf: &ByondValue,
     dir: i32,
     pass_flags: i32,
     pass_info: &ByondValue,
 ) -> Result<bool, NavPathError> {
-    tracy_span!("navmap.conditional_edge_multiz");
+    tracy_span!("navmap.conditional_edge");
     let blockers_list: ByondValue = turf.read_var("nav_blockers")?;
     if blockers_list.is_null() {
         return Ok(true);
     }
-    let entries =
+    let entries_list =
         match blockers_list.read_list_index::<_, ByondValue>(&ByondValue::new_num(dir as f32)) {
-            Ok(value) if value.is_list() => value.read_list()?,
+            Ok(value) if value.is_list() => value,
             _ => return Ok(true),
         };
-    for entry in entries {
+    let entries: Vec<_> = entries_list
+        .read_list()?
+        .into_iter()
+        .map(std::mem::ManuallyDrop::new)
+        .collect();
+    let eval_dir = ByondValue::new_num(dir as f32);
+    for entry in entries.iter() {
         if entry.is_number() {
             if pass_flags & entry.get_number()? as i32 == 0 {
                 return Ok(false);
             }
             continue;
         }
-        let blocker_loc: ByondValue = entry.read_var("loc")?;
-        let eval_dir = if blocker_loc == *turf {
-            dir
-        } else {
-            reverse_dir(dir)
-        };
-        let result = entry.call(
-            "CanAStarPass",
-            &[ByondValue::new_num(eval_dir as f32), pass_info.clone()],
-        )?;
+        // Resolve and evaluate in one DM callback, without a native loc read.
+        let result = turf.call("nav_blocker_can_pass", [&**entry, &eval_dir, pass_info])?;
         if !truthy(&result) {
             return Ok(false);
         }
@@ -447,6 +393,7 @@ fn new_multi_search_job(
     diagonal_handling: ByondValue,
     skip_first: ByondValue,
     max_path_cost: ByondValue,
+    allow_nav_links: ByondValue,
 ) -> Result<Option<MultiSearchJob>, NavPathError> {
     let start_xyz = start.xyz().ok_or(NavPathError::NotATurf)?;
     let end_xyz = end.xyz().ok_or(NavPathError::NotATurf)?;
@@ -470,46 +417,43 @@ fn new_multi_search_job(
         .and_then(|value| value.get_number())
         .map(|number| number as i32)
         .unwrap_or(0);
-    let links: Vec<NavLink> = NAV_LINKS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .values()
-        .copied()
-        .collect();
-    let mut links_by_source: HashMap<TurfCoords, Vec<NavLink>> = HashMap::new();
-    for link in &links {
-        links_by_source.entry(link.source).or_default().push(*link);
-    }
+    let allow_nav_links = truthy(&allow_nav_links);
+    let nav_links_by_source = if allow_nav_links {
+        NAV_LINKS_BY_SOURCE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    } else {
+        HashMap::new()
+    };
+    let nav_links: Vec<NavLink> = nav_links_by_source.values().flatten().copied().collect();
     let is_flying = truthy(&is_flying);
     Ok(Some(MultiSearchJob {
         grid: LayeredGrid {
             topology: topology.clone(),
             pass_flags,
             is_flying,
+            allow_nav_links,
             start: start_node,
             max_range,
             max_cost: max_path_cost,
             simulated_only: truthy(&simulated_only),
             avoid,
-            links_by_source,
+            nav_links_by_source,
             cache: HashMap::new(),
         },
         goal: goal_node,
-        heuristic: PortalHeuristic::new(
+        heuristic: NavLinkHeuristic::new(
             &topology,
             goal_node,
             min_target_distance,
             is_flying,
-            &links,
+            &nav_links,
         ),
         min_target_distance,
         diagonal_handling: DiagonalHandling::from_byond(&diagonal_handling),
         skip_first: truthy(&skip_first),
-        frontier: BinaryHeap::new(),
-        costs: HashMap::new(),
-        previous: HashMap::new(),
-        initialized: false,
-        sequence: 0,
+        search: AStarCore::default(),
         last_touched: Instant::now(),
     }))
 }
@@ -554,6 +498,40 @@ fn cached_unconditional_edges(nav_pass: i32, is_flying: bool) -> Option<(i32, i3
     Some((open, vertical))
 }
 
+/// Resolves movement-class edge bits and optional flying vertical edges using shared packed rules.
+fn resolve_packed_edges<E, Evaluate>(
+    nav_pass: i32,
+    is_flying: bool,
+    include_vertical: bool,
+    mut evaluate_conditional: Evaluate,
+) -> Result<(i32, i32), E>
+where
+    Evaluate: FnMut(i32) -> Result<bool, E>,
+{
+    let class_shift = if is_flying { FLYING_SHIFT } else { 0 };
+    let mut open = 0;
+    for dir in CARDINALS {
+        if nav_pass & (dir << class_shift) == 0 {
+            continue;
+        }
+        if nav_pass & (dir << COND_SHIFT) == 0 || evaluate_conditional(dir)? {
+            open |= dir;
+        }
+    }
+    let mut vertical = 0;
+    if include_vertical && is_flying {
+        for dir in [UP, DOWN] {
+            if nav_pass & (dir << FLYING_SHIFT) == 0 {
+                continue;
+            }
+            if nav_pass & (dir << COND_SHIFT) == 0 || evaluate_conditional(dir)? {
+                vertical |= dir;
+            }
+        }
+    }
+    Ok((open, vertical))
+}
+
 /// Stores one packed navmap value in the shared cache.
 fn cache_nav_pass(coords: TurfCoords, nav_pass: i32) {
     // DM publishes both baked values and invalidations here. Keeping an unbaked value is
@@ -562,19 +540,6 @@ fn cache_nav_pass(coords: TurfCoords, nav_pass: i32) {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .insert(coords, nav_pass);
-}
-
-/// Returns the opposite cardinal or vertical direction.
-fn reverse_dir(dir: i32) -> i32 {
-    match dir {
-        NORTH => SOUTH,
-        SOUTH => NORTH,
-        EAST => WEST,
-        WEST => EAST,
-        UP => DOWN,
-        DOWN => UP,
-        other => other,
-    }
 }
 
 /// Reads packed navmap data from a DM turf.
@@ -640,6 +605,19 @@ fn relaxed_distance(
     Some(horizontal.saturating_add(vertical))
 }
 
+/// Encodes per-node traversal actions in the shared native result format.
+fn actions_to_byond(actions: Vec<SearchAction>) -> Result<ByondValue, NavPathError> {
+    Ok(actions
+        .into_iter()
+        .map(|action| match action {
+            SearchAction::None => ByondValue::NULL,
+            SearchAction::Vertical(dir) => ByondValue::new_num(dir as f32),
+            SearchAction::NavLink(id) => ByondValue::new_num(-(id as f32)),
+        })
+        .collect::<Vec<_>>()
+        .to_byond()?)
+}
+
 #[cfg(test)]
 /// Expands diagonals without fallible native lookups.
 fn expand_diagonals<F>(
@@ -658,79 +636,16 @@ where
     for &next in rest {
         if next.0 != previous.0 && next.1 != previous.1 {
             let routes = routes_for(previous, next);
-            let intermediate = match handling {
-                DiagonalHandling::DoNothing => None,
-                DiagonalHandling::RemoveAll if routes.north_south_first => {
-                    Some((previous.0, next.1))
-                }
-                DiagonalHandling::RemoveAll if routes.east_west_first => Some((next.0, previous.1)),
-                DiagonalHandling::RemoveClunky
-                    if !routes.north_south_first && routes.east_west_first =>
-                {
-                    Some((next.0, previous.1))
-                }
-                DiagonalHandling::RemoveClunky => None,
-                DiagonalHandling::RemoveAll => return None,
-            };
-            if let Some(intermediate) = intermediate {
-                expanded.push(intermediate);
+            match search::diagonal_intermediate(previous, next, handling, routes) {
+                Ok(Some(intermediate)) => expanded.push(intermediate),
+                Ok(None) => {}
+                Err(()) => return None,
             }
         }
         expanded.push(next);
         previous = next;
     }
     Some(expanded)
-}
-
-/// Expands diagonals while rechecking native passability.
-fn expand_diagonals_checked<F, E>(
-    nodes: &[Coord],
-    handling: DiagonalHandling,
-    mut routes_for: F,
-) -> Result<Option<Vec<Coord>>, E>
-where
-    F: FnMut(Coord, Coord) -> Result<DiagonalRoutes, E>,
-{
-    let Some((&start, rest)) = nodes.split_first() else {
-        return Ok(Some(Vec::new()));
-    };
-    let mut expanded = vec![start];
-    let mut previous = start;
-    for &next in rest {
-        if next.0 != previous.0 && next.1 != previous.1 {
-            let routes = routes_for(previous, next)?;
-            let intermediate = match handling {
-                DiagonalHandling::DoNothing => None,
-                DiagonalHandling::RemoveAll if routes.north_south_first => {
-                    Some((previous.0, next.1))
-                }
-                DiagonalHandling::RemoveAll if routes.east_west_first => Some((next.0, previous.1)),
-                DiagonalHandling::RemoveClunky
-                    if !routes.north_south_first && routes.east_west_first =>
-                {
-                    Some((next.0, previous.1))
-                }
-                // Clunky handling only replaces a diagonal when its vertical-first route is
-                // blocked. A valid vertical-first route keeps the direct diagonal.
-                DiagonalHandling::RemoveClunky => None,
-                DiagonalHandling::RemoveAll => return Ok(None),
-            };
-            if let Some(intermediate) = intermediate {
-                expanded.push(intermediate);
-            }
-        }
-        expanded.push(next);
-        previous = next;
-    }
-    Ok(Some(expanded))
-}
-
-/// Removes the starting node when requested by DM.
-fn apply_skip_first(mut nodes: Vec<Coord>, skip_first: bool) -> Vec<Coord> {
-    if skip_first && !nodes.is_empty() {
-        nodes.remove(0);
-    }
-    nodes
 }
 
 /// Creates an empty DM list.
@@ -811,17 +726,30 @@ fn run_job(
     pass_info: &ByondValue,
 ) -> Result<(Option<SearchJob>, ByondValue), NavPathError> {
     match job.step(pass_info)? {
-        JobProgress::InProgress => Ok((
+        SearchProgress::InProgress => Ok((
             Some(job),
             status_response("in_progress", Some(job_id), None, None)?,
         )),
-        JobProgress::NoPath => Ok((
+        SearchProgress::Stale => Ok((
             None,
-            status_response("no_path", None, Some(empty_list()?), None)?,
+            status_response("stale_topology", Some(job_id), None, None)?,
         )),
-        JobProgress::Found(nodes) => {
-            let path = job.final_path(nodes, pass_info)?;
-            Ok((None, status_response("complete", None, Some(path), None)?))
+        SearchProgress::NoPath => Ok((
+            None,
+            status_response_with_actions(
+                "no_path",
+                None,
+                Some(empty_list()?),
+                Some(ByondValue::new_list()?),
+                None,
+            )?,
+        )),
+        SearchProgress::Found(nodes, actions) => {
+            let (path, actions) = job.final_path(nodes, actions, pass_info)?;
+            Ok((
+                None,
+                status_response_with_actions("complete", None, Some(path), Some(actions), None)?,
+            ))
         }
     }
 }
@@ -851,8 +779,8 @@ fn run_multi_job(
                 None,
             )?,
         )),
-        MultiJobProgress::Found(goal) => {
-            let (path, actions) = job.final_path(goal, pass_info)?;
+        MultiJobProgress::Found(nodes, actions) => {
+            let (path, actions) = job.final_path(nodes, actions, pass_info)?;
             Ok((
                 None,
                 status_response_with_actions("complete", None, Some(path), Some(actions), None)?,
@@ -874,6 +802,8 @@ fn new_search_job(
     avoid_turf: ByondValue,
     diagonal_handling: ByondValue,
     skip_first: ByondValue,
+    max_path_cost: ByondValue,
+    allow_nav_links: ByondValue,
 ) -> Result<Option<SearchJob>, NavPathError> {
     let start_xyz = start.xyz().ok_or(NavPathError::NotATurf)?;
     let end_xyz = end.xyz().ok_or(NavPathError::NotATurf)?;
@@ -884,6 +814,7 @@ fn new_search_job(
     }
     let max_range = max_range.get_number().unwrap_or(0.0).max(0.0) as i32;
     let min_target_distance = min_target_distance.get_number().unwrap_or(0.0).max(0.0) as i32;
+    let max_path_cost = max_path_cost.get_number().unwrap_or(0.0).max(0.0) as u32;
     let avoid = if avoid_turf.is_null() {
         None
     } else {
@@ -905,6 +836,29 @@ fn new_search_job(
         .and_then(|value| value.get_number())
         .map(|number| number as i32)
         .unwrap_or(0);
+    let mut nav_links_by_source: HashMap<Coord, Vec<NavLink>> = HashMap::new();
+    if truthy(&allow_nav_links) {
+        let nav_links_by_world_source = NAV_LINKS_BY_SOURCE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for (&(x, y, z), nav_links) in nav_links_by_world_source.iter() {
+            if z != sz {
+                continue;
+            }
+            for &nav_link in nav_links {
+                if nav_link.destination.2 == sz {
+                    nav_links_by_source
+                        .entry((x, y))
+                        .or_default()
+                        .push(nav_link);
+                }
+            }
+        }
+    }
+    let nav_links: Vec<NavLink> = nav_links_by_source.values().flatten().copied().collect();
+    let topology_generation = (!nav_links.is_empty()).then(topology_generation);
+    let heuristic = (!nav_links.is_empty())
+        .then(|| FlatNavLinkHeuristic::new((ex, ey), min_target_distance, &nav_links));
     Ok(Some(SearchJob::new(
         Grid {
             z: sz,
@@ -912,13 +866,17 @@ fn new_search_job(
             is_flying: truthy(&is_flying),
             start: (sx, sy),
             max_range,
+            max_cost: max_path_cost,
             simulated_only: truthy(&simulated_only),
             avoid,
+            nav_links_by_source,
             cache: HashMap::new(),
         },
         (ex, ey),
         min_target_distance,
         DiagonalHandling::from_byond(&diagonal_handling),
         truthy(&skip_first),
+        topology_generation,
+        heuristic,
     )))
 }
