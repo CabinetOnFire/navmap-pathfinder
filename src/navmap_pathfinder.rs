@@ -167,7 +167,6 @@ impl CostProfile {
             let multiplier = pair[1].get_number()?;
             if !flag_value.is_finite()
                 || flag_value < 1.0
-                || flag_value > (1 << 23) as f32
                 || flag_value.fract() != 0.0
                 || !multiplier.is_finite()
                 || multiplier < 1.0
