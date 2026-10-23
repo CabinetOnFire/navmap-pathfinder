@@ -78,25 +78,27 @@ impl LayeredGrid {
             return Ok(None);
         };
         let coords = (node.x, node.y, z);
-        let entry = match cached_nav_pass(coords) {
-            Some(nav_pass) if nav_pass & BAKED_FLAG != 0 => {
+        let entry = match cached_nav_data(coords) {
+            Some(data) if data.nav_pass & BAKED_FLAG != 0 => {
                 if let Some((open_edges, vertical_open)) =
-                    cached_unconditional_edges(nav_pass, self.is_flying)
+                    cached_unconditional_edges(data.nav_pass, self.is_flying)
                 {
                     Some(TurfInfo {
                         open_edges: open_edges | (vertical_open << 24),
-                        simulated: nav_pass_is_simulated(nav_pass),
+                        simulated: nav_pass_is_simulated(data.nav_pass),
+                        cost_flags: data.nav_cost_flags,
                     })
                 } else {
                     let turf = locate_xyz(ByondXYZ::new(node.x, node.y, z))?;
                     if turf.is_null() {
                         None
                     } else {
-                        let (open_edges, vertical_open, nav_pass) =
+                        let (open_edges, vertical_open, nav_pass, cost_flags) =
                             self.resolve_edges(coords, &turf, pass_info)?;
                         Some(TurfInfo {
                             open_edges: open_edges | (vertical_open << 24),
                             simulated: nav_pass_is_simulated(nav_pass),
+                            cost_flags,
                         })
                     }
                 }
@@ -106,11 +108,12 @@ impl LayeredGrid {
                 if turf.is_null() {
                     None
                 } else {
-                    let (open_edges, vertical_open, nav_pass) =
+                    let (open_edges, vertical_open, nav_pass, cost_flags) =
                         self.resolve_edges(coords, &turf, pass_info)?;
                     Some(TurfInfo {
                         open_edges: open_edges | (vertical_open << 24),
                         simulated: nav_pass_is_simulated(nav_pass),
+                        cost_flags,
                     })
                 }
             }
@@ -125,20 +128,25 @@ impl LayeredGrid {
         coords: TurfCoords,
         turf: &ByondValue,
         pass_info: &ByondValue,
-    ) -> Result<(i32, i32, i32), NavPathError> {
-        let mut nav_pass = cached_nav_pass(coords).unwrap_or(read_nav_pass(turf)?);
+    ) -> Result<(i32, i32, i32, u32), NavPathError> {
+        let cached = cached_nav_data(coords);
+        let (mut nav_pass, mut cost_flags) = match cached {
+            Some(data) => (data.nav_pass, data.nav_cost_flags),
+            None => (read_nav_pass(turf)?, read_nav_cost_flags(turf)?),
+        };
         if nav_pass & BAKED_FLAG == 0 {
             let _: () = turf.call("nav_bake", std::iter::empty::<ByondValue>())?;
             nav_pass = read_nav_pass(turf)?;
+            cost_flags = read_nav_cost_flags(turf)?;
             if nav_pass & BAKED_FLAG == 0 {
-                return Ok((0, 0, nav_pass));
+                return Ok((0, 0, nav_pass, cost_flags));
             }
-            cache_nav_pass(coords, nav_pass);
+            cache_nav_data(coords, nav_pass, cost_flags);
         }
         let (open, vertical) = resolve_packed_edges(nav_pass, self.is_flying, true, |dir| {
             evaluate_conditional_edge(turf, dir, self.pass_flags, pass_info)
         })?;
-        Ok((open, vertical, nav_pass))
+        Ok((open, vertical, nav_pass, cost_flags))
     }
 
     /// Returns cached node data when the node is occupiable.
@@ -237,14 +245,66 @@ impl LayeredGrid {
                 y: from.y + dy,
                 ..from
             };
-            let walkable = if dx == 0 || dy == 0 {
-                source.open_edges & step != 0 && self.can_occupy(to, pass_info)?
+            if dx == 0 || dy == 0 {
+                if source.open_edges & step == 0 {
+                    continue;
+                }
+                let Some(destination) = self.occupiable_info(to, pass_info)? else {
+                    continue;
+                };
+                out.push((
+                    to,
+                    self.costs.step_cost(cost, destination.cost_flags),
+                    SearchAction::None,
+                ));
             } else {
                 let routes = self.diagonal_routes(from, to, pass_info)?;
-                routes.north_south_first || routes.east_west_first
-            };
-            if walkable {
-                out.push((to, cost, SearchAction::None));
+                if !routes.north_south_first && !routes.east_west_first {
+                    continue;
+                }
+                let Some(destination) = self.occupiable_info(to, pass_info)? else {
+                    continue;
+                };
+                let expand_all = self.diagonal_handling == DiagonalHandling::RemoveAll;
+                let expand_clunky = self.diagonal_handling == DiagonalHandling::RemoveClunky
+                    && !routes.north_south_first
+                    && routes.east_west_first;
+                if expand_all || expand_clunky {
+                    let north_south_mid = LayeredNode { x: from.x, y: to.y, ..from };
+                    let east_west_mid = LayeredNode { x: to.x, y: from.y, ..from };
+                    let mut selected: Option<(u32, LayeredNode)> = None;
+                    if routes.north_south_first {
+                        if let Some(mid) = self.occupiable_info(north_south_mid, pass_info)? {
+                            selected = Some((
+                                self.costs.step_cost(10, mid.cost_flags)
+                                    .saturating_add(self.costs.step_cost(10, destination.cost_flags)),
+                                north_south_mid,
+                            ));
+                        }
+                    }
+                    if routes.east_west_first {
+                        if let Some(mid) = self.occupiable_info(east_west_mid, pass_info)? {
+                            let candidate = self.costs.step_cost(10, mid.cost_flags)
+                                .saturating_add(self.costs.step_cost(10, destination.cost_flags));
+                            if selected.is_none_or(|(old, _)| candidate < old) {
+                                selected = Some((candidate, east_west_mid));
+                            }
+                        }
+                    }
+                    if let Some((route_cost, mid)) = selected {
+                        out.push((
+                            to,
+                            route_cost,
+                            SearchAction::Diagonal(mid.x, mid.y),
+                        ));
+                    }
+                } else {
+                    out.push((
+                        to,
+                        self.costs.step_cost(cost, destination.cost_flags),
+                        SearchAction::None,
+                    ));
+                }
             }
         }
         if self.is_flying {
@@ -257,8 +317,12 @@ impl LayeredGrid {
                     layer: from.layer + delta,
                     ..from
                 };
-                if self.can_occupy(to, pass_info)? {
-                    out.push((to, 10, SearchAction::Vertical(dir)));
+                if let Some(destination) = self.occupiable_info(to, pass_info)? {
+                    out.push((
+                        to,
+                        self.costs.step_cost(10, destination.cost_flags),
+                        SearchAction::Vertical(dir),
+                    ));
                 }
             }
         }
@@ -284,16 +348,20 @@ impl LayeredGrid {
                     x: nav_link.destination.0,
                     y: nav_link.destination.1,
                 };
-                if !self.can_occupy(to, pass_info)? {
+                let Some(destination) = self.occupiable_info(to, pass_info)? else {
                     continue;
-                }
+                };
                 tracy_span!("navmap.link_can_plan");
                 let allowed: ByondValue = call_global(
                     "navmap_pathfinder_link_can_plan",
                     [ByondValue::new_num(nav_link.id as f32), pass_info.clone()],
                 )?;
                 if truthy(&allowed) {
-                    out.push((to, nav_link.cost, SearchAction::NavLink(nav_link.id)));
+                    out.push((
+                        to,
+                        self.costs.step_cost(nav_link.cost, destination.cost_flags),
+                        SearchAction::NavLink(nav_link.id),
+                    ));
                 }
             }
         }
@@ -314,6 +382,9 @@ impl MultiSearchJob {
         if topology_generation() != self.grid.topology.generation {
             return Ok(MultiJobProgress::Stale);
         }
+        if self.grid.costs.has_modifiers() && nav_cost_generation() != self.grid.cost_generation {
+            return Ok(MultiJobProgress::StaleCosts);
+        }
         let goal = self.goal;
         let min_target_distance = self.min_target_distance;
         if !self.search.is_initialized() {
@@ -323,7 +394,7 @@ impl MultiSearchJob {
             let estimate = self.heuristic.estimate(self.grid.start);
             self.search.initialize(self.grid.start, estimate);
         }
-        match self.search.step(
+        let progress = self.search.step(
             Some(self.grid.max_cost),
             |node| {
                 node.group == goal.group
@@ -332,10 +403,15 @@ impl MultiSearchJob {
             },
             |node| self.grid.successors(node, pass_info),
             |node| self.heuristic.estimate(node),
-        )? {
+        )?;
+        if self.grid.costs.has_modifiers() && nav_cost_generation() != self.grid.cost_generation {
+            return Ok(MultiJobProgress::StaleCosts);
+        }
+        match progress {
             SearchProgress::InProgress => Ok(MultiJobProgress::InProgress),
             SearchProgress::NoPath => Ok(MultiJobProgress::NoPath),
             SearchProgress::Stale => Ok(MultiJobProgress::Stale),
+            SearchProgress::StaleCosts => Ok(MultiJobProgress::StaleCosts),
             SearchProgress::Found(nodes, actions) => Ok(MultiJobProgress::Found(nodes, actions)),
         }
     }
@@ -356,7 +432,7 @@ impl MultiSearchJob {
             |from, to, action| {
                 from.group == to.group
                     && from.layer == to.layer
-                    && matches!(action, SearchAction::None)
+                    && matches!(action, SearchAction::None | SearchAction::Diagonal(_, _))
             },
             |from, to| self.grid.diagonal_routes(from, to, pass_info),
         )?

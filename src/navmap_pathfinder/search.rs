@@ -56,6 +56,7 @@ pub(super) enum SearchProgress<N> {
     Found(Vec<N>, Vec<SearchAction>),
     NoPath,
     Stale,
+    StaleCosts,
 }
 
 /// Shared A* frontier, cost relaxation, stale-entry handling, and path reconstruction.
@@ -359,8 +360,13 @@ where
             && from_coord.0 != to_coord.0
             && from_coord.1 != to_coord.1
         {
-            let routes = routes_for(previous, next)?;
-            match diagonal_intermediate(from_coord, to_coord, handling, routes) {
+            let intermediate = if let SearchAction::Diagonal(x, y) = action {
+                Ok(Some((x, y)))
+            } else {
+                let routes = routes_for(previous, next)?;
+                diagonal_intermediate(from_coord, to_coord, handling, routes)
+            };
+            match intermediate {
                 Ok(Some(intermediate)) => {
                     expanded_nodes.push(make_intermediate(previous, intermediate));
                     expanded_actions.push(SearchAction::None);
@@ -412,6 +418,9 @@ impl SearchJob {
         {
             return Ok(SearchProgress::Stale);
         }
+        if self.grid.costs.has_modifiers() && nav_cost_generation() != self.grid.cost_generation {
+            return Ok(SearchProgress::StaleCosts);
+        }
         let goal = self.goal;
         let min_target_distance = self.min_target_distance;
         if !self.search.is_initialized() {
@@ -424,7 +433,7 @@ impl SearchJob {
             );
             self.search.initialize(self.grid.start, estimate);
         }
-        self.search.step(
+        let progress = self.search.step(
             Some(self.grid.max_cost),
             |coord| chebyshev_distance(coord, goal) <= min_target_distance,
             |coord| self.grid.successors(coord, pass_info),
@@ -434,7 +443,11 @@ impl SearchJob {
                     |heuristic| heuristic.estimate(coord),
                 )
             },
-        )
+        )?;
+        if self.grid.costs.has_modifiers() && nav_cost_generation() != self.grid.cost_generation {
+            return Ok(SearchProgress::StaleCosts);
+        }
+        Ok(progress)
     }
 
     /// Rechecks and converts a coordinate path and action sidecar to DM values.
@@ -450,7 +463,7 @@ impl SearchJob {
             self.diagonal_handling,
             |node| node,
             |_, coord| coord,
-            |_, _, action| matches!(action, SearchAction::None),
+            |_, _, action| matches!(action, SearchAction::None | SearchAction::Diagonal(_, _)),
             |from, to| self.grid.diagonal_routes(from, to, pass_info),
         )?
         else {

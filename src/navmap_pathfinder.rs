@@ -76,9 +76,17 @@ type TurfCoords = (i16, i16, i16);
 /// A two-dimensional turf position.
 type Coord = (i16, i16);
 
-/// Cached packed navmap values received from DM.
-static NAV_PASS_CACHE: LazyLock<Mutex<HashMap<TurfCoords, i32>>> =
+#[derive(Clone, Copy, Default)]
+struct CachedNavData {
+    nav_pass: i32,
+    nav_cost_flags: u32,
+}
+
+/// Cached packed passability and terrain-cost values received from DM.
+static NAV_PASS_CACHE: LazyLock<Mutex<HashMap<TurfCoords, CachedNavData>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+/// Generation used to invalidate yielded searches after a published cost change.
+static NAV_COST_GENERATION: AtomicU64 = AtomicU64::new(0);
 /// Active single-z search jobs.
 static SEARCH_JOBS: LazyLock<Mutex<HashMap<u64, SearchJob>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -104,8 +112,12 @@ enum NavPathError {
     DifferentZLevels,
     #[error("argument was not a turf")]
     NotATurf,
-    #[error("navmap bulk update list length must be a multiple of 4")]
+    #[error("navmap bulk update list length must be a multiple of 5")]
     InvalidBulkUpdateLength,
+    #[error("navmap topology update list length must be a multiple of 3")]
+    InvalidTopologyUpdateLength,
+    #[error("nav cost modifiers must be flag/multiplier pairs")]
+    InvalidCostModifiers,
 }
 
 /// Controls how diagonal steps are returned to DM.
@@ -133,6 +145,68 @@ struct TurfInfo {
     open_edges: i32,
     /// Whether the turf is simulated rather than space.
     simulated: bool,
+    /// Turf-level terrain modifier flags.
+    cost_flags: u32,
+}
+
+/// Per-search modifier weights and cached combined multipliers by turf flag combination.
+struct CostProfile {
+    modifiers: Vec<(u32, f32)>,
+    combined: HashMap<u32, f32>,
+}
+
+impl CostProfile {
+    fn from_byond(value: &ByondValue) -> Result<Self, NavPathError> {
+        let values = value.read_list()?;
+        if !values.len().is_multiple_of(2) {
+            return Err(NavPathError::InvalidCostModifiers);
+        }
+        let mut modifiers = Vec::with_capacity(values.len() / 2);
+        for pair in values.chunks_exact(2) {
+            let flag_value = pair[0].get_number()?;
+            let multiplier = pair[1].get_number()?;
+            if !flag_value.is_finite()
+                || flag_value < 1.0
+                || flag_value > (1 << 23) as f32
+                || flag_value.fract() != 0.0
+                || !multiplier.is_finite()
+                || multiplier < 1.0
+            {
+                return Err(NavPathError::InvalidCostModifiers);
+            }
+            let flag = flag_value as u32;
+            if !flag.is_power_of_two() {
+                return Err(NavPathError::InvalidCostModifiers);
+            }
+            modifiers.push((flag, multiplier));
+        }
+        Ok(Self {
+            modifiers,
+            combined: HashMap::new(),
+        })
+    }
+
+    fn multiplier(&mut self, flags: u32) -> f32 {
+        if let Some(multiplier) = self.combined.get(&flags) {
+            return *multiplier;
+        }
+        let mut multiplier = 1.0;
+        for &(flag, weight) in &self.modifiers {
+            if flags & flag != 0 {
+                multiplier *= weight;
+            }
+        }
+        self.combined.insert(flags, multiplier);
+        multiplier
+    }
+
+    fn step_cost(&mut self, base: u32, flags: u32) -> u32 {
+        ((base as f32) * self.multiplier(flags)).ceil() as u32
+    }
+
+    fn has_modifiers(&self) -> bool {
+        !self.modifiers.is_empty()
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -157,6 +231,8 @@ struct Grid {
     max_range: i32,
     /// Maximum total path cost, or zero for unlimited.
     max_cost: u32,
+    /// Requested diagonal output mode used when pricing expanded diagonal moves.
+    diagonal_handling: DiagonalHandling,
     /// Whether only simulated turfs are allowed.
     simulated_only: bool,
     /// Optional turf excluded from the search.
@@ -165,6 +241,10 @@ struct Grid {
     nav_links_by_source: HashMap<Coord, Vec<NavLink>>,
     /// Cached turf lookups.
     cache: HashMap<Coord, Option<TurfInfo>>,
+    /// Search-specific terrain cost weights.
+    costs: CostProfile,
+    /// Cost generation at search start.
+    cost_generation: u64,
 }
 
 /// Resumable single-z A* search state.
@@ -240,6 +320,8 @@ struct LayeredNode {
 enum SearchAction {
     #[default]
     None,
+    /// Cardinal intermediate selected when a diagonal is charged as two cardinal steps.
+    Diagonal(i16, i16),
     Vertical(i32),
     NavLink(u64),
 }
@@ -280,6 +362,8 @@ struct LayeredGrid {
     max_range: i32,
     /// Maximum total path cost, or zero for unlimited.
     max_cost: u32,
+    /// Diagonal mode used when pricing moves DM returns as cardinal steps.
+    diagonal_handling: DiagonalHandling,
     /// Whether only simulated turfs are allowed.
     simulated_only: bool,
     /// Optional node excluded from the search.
@@ -288,6 +372,10 @@ struct LayeredGrid {
     nav_links_by_source: HashMap<TurfCoords, Vec<NavLink>>,
     /// Cached node lookups.
     cache: HashMap<LayeredNode, Option<TurfInfo>>,
+    /// Search-specific terrain cost weights.
+    costs: CostProfile,
+    /// Cost generation at search start.
+    cost_generation: u64,
 }
 
 enum MultiJobProgress {
@@ -295,6 +383,7 @@ enum MultiJobProgress {
     Found(Vec<LayeredNode>, Vec<SearchAction>),
     NoPath,
     Stale,
+    StaleCosts,
 }
 
 /// Resumable multi-z A* search state.
@@ -394,6 +483,7 @@ fn new_multi_search_job(
     skip_first: ByondValue,
     max_path_cost: ByondValue,
     allow_nav_links: ByondValue,
+    cost_modifiers: ByondValue,
 ) -> Result<Option<MultiSearchJob>, NavPathError> {
     let start_xyz = start.xyz().ok_or(NavPathError::NotATurf)?;
     let end_xyz = end.xyz().ok_or(NavPathError::NotATurf)?;
@@ -406,6 +496,8 @@ fn new_multi_search_job(
     let max_range = max_range.get_number().unwrap_or(0.0).max(0.0) as i32;
     let min_target_distance = min_target_distance.get_number().unwrap_or(0.0).max(0.0) as i32;
     let max_path_cost = max_path_cost.get_number().unwrap_or(0.0).max(0.0) as u32;
+    let costs = CostProfile::from_byond(&cost_modifiers)?;
+    let cost_generation = nav_cost_generation();
     let avoid = if avoid_turf.is_null() {
         None
     } else {
@@ -437,10 +529,13 @@ fn new_multi_search_job(
             start: start_node,
             max_range,
             max_cost: max_path_cost,
+            diagonal_handling: DiagonalHandling::from_byond(&diagonal_handling),
             simulated_only: truthy(&simulated_only),
             avoid,
             nav_links_by_source,
             cache: HashMap::new(),
+            costs,
+            cost_generation,
         },
         goal: goal_node,
         heuristic: NavLinkHeuristic::new(
@@ -460,11 +555,37 @@ fn new_multi_search_job(
 
 /// Reads one packed navmap value from the shared cache.
 fn cached_nav_pass(coords: TurfCoords) -> Option<i32> {
+    cached_nav_data(coords).map(|data| data.nav_pass)
+}
+
+fn cached_nav_cost_flags(coords: TurfCoords) -> Option<u32> {
+    cached_nav_data(coords).map(|data| data.nav_cost_flags)
+}
+
+fn cached_nav_data(coords: TurfCoords) -> Option<CachedNavData> {
     NAV_PASS_CACHE
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .get(&coords)
         .copied()
+}
+
+fn read_nav_cost_flags(turf: &ByondValue) -> Result<u32, NavPathError> {
+    Ok(turf
+        .read_var::<_, ByondValue>("nav_cost_flags")
+        .and_then(|value| value.get_number())
+        .map(|number| {
+            if number < 0.0 {
+                0
+            } else {
+                number as u32
+            }
+        })
+        .unwrap_or(0))
+}
+
+fn nav_cost_generation() -> u64 {
+    NAV_COST_GENERATION.load(AtomicOrdering::Acquire)
 }
 
 /// Decodes cached baked edges when no live conditional blocker lookup is needed.
@@ -534,12 +655,27 @@ where
 
 /// Stores one packed navmap value in the shared cache.
 fn cache_nav_pass(coords: TurfCoords, nav_pass: i32) {
+    let cost_flags = cached_nav_cost_flags(coords).unwrap_or(0);
+    cache_nav_data(coords, nav_pass, cost_flags);
+}
+
+/// Stores packed passability and modifier flags, invalidating cost-aware jobs on changes.
+fn cache_nav_data(coords: TurfCoords, nav_pass: i32, nav_cost_flags: u32) {
     // DM publishes both baked values and invalidations here. Keeping an unbaked value is
     // intentional: resolve_edges will force a fresh bake before using it.
-    NAV_PASS_CACHE
+    let mut cache = NAV_PASS_CACHE
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .insert(coords, nav_pass);
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let previous = cache.insert(
+        coords,
+        CachedNavData {
+            nav_pass,
+            nav_cost_flags,
+        },
+    );
+    if previous.is_some_and(|data| data.nav_cost_flags != nav_cost_flags) {
+        NAV_COST_GENERATION.fetch_add(1, AtomicOrdering::Release);
+    }
 }
 
 /// Reads packed navmap data from a DM turf.
@@ -610,7 +746,7 @@ fn actions_to_byond(actions: Vec<SearchAction>) -> Result<ByondValue, NavPathErr
     Ok(actions
         .into_iter()
         .map(|action| match action {
-            SearchAction::None => ByondValue::NULL,
+            SearchAction::None | SearchAction::Diagonal(_, _) => ByondValue::NULL,
             SearchAction::Vertical(dir) => ByondValue::new_num(dir as f32),
             SearchAction::NavLink(id) => ByondValue::new_num(-(id as f32)),
         })
@@ -734,6 +870,10 @@ fn run_job(
             None,
             status_response("stale_topology", Some(job_id), None, None)?,
         )),
+        SearchProgress::StaleCosts => Ok((
+            None,
+            status_response("stale_costs", Some(job_id), None, None)?,
+        )),
         SearchProgress::NoPath => Ok((
             None,
             status_response_with_actions(
@@ -768,6 +908,10 @@ fn run_multi_job(
         MultiJobProgress::Stale => Ok((
             None,
             status_response("stale_topology", Some(job_id), None, None)?,
+        )),
+        MultiJobProgress::StaleCosts => Ok((
+            None,
+            status_response("stale_costs", Some(job_id), None, None)?,
         )),
         MultiJobProgress::NoPath => Ok((
             None,
@@ -804,6 +948,7 @@ fn new_search_job(
     skip_first: ByondValue,
     max_path_cost: ByondValue,
     allow_nav_links: ByondValue,
+    cost_modifiers: ByondValue,
 ) -> Result<Option<SearchJob>, NavPathError> {
     let start_xyz = start.xyz().ok_or(NavPathError::NotATurf)?;
     let end_xyz = end.xyz().ok_or(NavPathError::NotATurf)?;
@@ -815,6 +960,8 @@ fn new_search_job(
     let max_range = max_range.get_number().unwrap_or(0.0).max(0.0) as i32;
     let min_target_distance = min_target_distance.get_number().unwrap_or(0.0).max(0.0) as i32;
     let max_path_cost = max_path_cost.get_number().unwrap_or(0.0).max(0.0) as u32;
+    let costs = CostProfile::from_byond(&cost_modifiers)?;
+    let cost_generation = nav_cost_generation();
     let avoid = if avoid_turf.is_null() {
         None
     } else {
@@ -867,10 +1014,13 @@ fn new_search_job(
             start: (sx, sy),
             max_range,
             max_cost: max_path_cost,
+            diagonal_handling: DiagonalHandling::from_byond(&diagonal_handling),
             simulated_only: truthy(&simulated_only),
             avoid,
             nav_links_by_source,
             cache: HashMap::new(),
+            costs,
+            cost_generation,
         },
         (ex, ey),
         min_target_distance,

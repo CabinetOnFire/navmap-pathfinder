@@ -17,25 +17,27 @@ impl Grid {
         }
 
         let coords = (x, y, self.z);
-        let entry = match cached_nav_pass(coords) {
+        let entry = match cached_nav_data(coords) {
             // Published baked data is authoritative for unconditional edges. Avoid crossing the BYOND FFI for the overwhelmingly common static-map case.
-            Some(nav_pass) if nav_pass & BAKED_FLAG != 0 => {
-                if let Some((open_edges, _)) = cached_unconditional_edges(nav_pass, self.is_flying)
+            Some(data) if data.nav_pass & BAKED_FLAG != 0 => {
+                if let Some((open_edges, _)) = cached_unconditional_edges(data.nav_pass, self.is_flying)
                 {
                     Some(TurfInfo {
                         open_edges,
-                        simulated: nav_pass_is_simulated(nav_pass),
+                        simulated: nav_pass_is_simulated(data.nav_pass),
+                        cost_flags: data.nav_cost_flags,
                     })
                 } else {
                     let turf = locate_xyz(ByondXYZ::new(x, y, self.z))?;
                     if turf.is_null() {
                         None
                     } else {
-                        let (open_edges, nav_pass) =
+                        let (open_edges, nav_pass, cost_flags) =
                             self.resolve_edges(coords, &turf, pass_info)?;
                         Some(TurfInfo {
                             open_edges,
                             simulated: nav_pass_is_simulated(nav_pass),
+                            cost_flags,
                         })
                     }
                 }
@@ -45,10 +47,11 @@ impl Grid {
                 if turf.is_null() {
                     None
                 } else {
-                    let (open_edges, nav_pass) = self.resolve_edges(coords, &turf, pass_info)?;
+                    let (open_edges, nav_pass, cost_flags) = self.resolve_edges(coords, &turf, pass_info)?;
                     Some(TurfInfo {
                         open_edges,
                         simulated: nav_pass_is_simulated(nav_pass),
+                        cost_flags,
                     })
                 }
             }
@@ -63,22 +66,27 @@ impl Grid {
         coords: TurfCoords,
         turf: &ByondValue,
         pass_info: &ByondValue,
-    ) -> Result<(i32, i32), NavPathError> {
-        let mut nav_pass = cached_nav_pass(coords).unwrap_or(read_nav_pass(turf)?);
+    ) -> Result<(i32, i32, u32), NavPathError> {
+        let cached = cached_nav_data(coords);
+        let (mut nav_pass, mut cost_flags) = match cached {
+            Some(data) => (data.nav_pass, data.nav_cost_flags),
+            None => (read_nav_pass(turf)?, read_nav_cost_flags(turf)?),
+        };
         if nav_pass & BAKED_FLAG == 0 {
             // Bake dirty turfs before trusting their edge bits.
             let _: () = turf.call("nav_bake", std::iter::empty::<ByondValue>())?;
             nav_pass = read_nav_pass(turf)?;
+            cost_flags = read_nav_cost_flags(turf)?;
             if nav_pass & BAKED_FLAG == 0 {
-                return Ok((0, nav_pass));
+                return Ok((0, nav_pass, cost_flags));
             }
-            cache_nav_pass(coords, nav_pass);
+            cache_nav_data(coords, nav_pass, cost_flags);
         }
 
         let (open, _) = resolve_packed_edges(nav_pass, self.is_flying, false, |dir| {
             evaluate_conditional_edge(turf, dir, self.pass_flags, pass_info)
         })?;
-        Ok((open, nav_pass))
+        Ok((open, nav_pass, cost_flags))
     }
 
     /// Returns cached turf data when the coordinate is occupiable.
@@ -188,29 +196,81 @@ impl Grid {
         let mut out = Vec::with_capacity(8);
         for (step, dx, dy, cost) in STEPS {
             let to = (from.0 + dx, from.1 + dy);
-            let walkable = if dx == 0 || dy == 0 {
-                source.open_edges & step != 0 && self.can_occupy(to, pass_info)?
+            if dx == 0 || dy == 0 {
+                if source.open_edges & step == 0 {
+                    continue;
+                }
+                let Some(destination) = self.occupiable_info(to, pass_info)? else {
+                    continue;
+                };
+                out.push((
+                    to,
+                    self.costs.step_cost(cost, destination.cost_flags),
+                    SearchAction::None,
+                ));
             } else {
-                let routes = self.diagonal_routes_from_source(source, from, to, pass_info, true)?;
-                routes.north_south_first || routes.east_west_first
-            };
-            if walkable {
-                out.push((to, cost, SearchAction::None));
+                let routes = self.diagonal_routes_from_source(source, from, to, pass_info, false)?;
+                if !routes.north_south_first && !routes.east_west_first {
+                    continue;
+                }
+                let Some(destination) = self.occupiable_info(to, pass_info)? else {
+                    continue;
+                };
+                let north_south_mid = (from.0, to.1);
+                let east_west_mid = (to.0, from.1);
+                let expand_all = self.diagonal_handling == DiagonalHandling::RemoveAll;
+                let expand_clunky = self.diagonal_handling == DiagonalHandling::RemoveClunky
+                    && !routes.north_south_first
+                    && routes.east_west_first;
+                if expand_all || expand_clunky {
+                    let mut selected: Option<(u32, Coord)> = None;
+                    if routes.north_south_first {
+                        if let Some(mid) = self.occupiable_info(north_south_mid, pass_info)? {
+                            selected = Some((
+                                self.costs.step_cost(10, mid.cost_flags)
+                                    .saturating_add(self.costs.step_cost(10, destination.cost_flags)),
+                                north_south_mid,
+                            ));
+                        }
+                    }
+                    if routes.east_west_first {
+                        if let Some(mid) = self.occupiable_info(east_west_mid, pass_info)? {
+                            let candidate = self.costs.step_cost(10, mid.cost_flags)
+                                .saturating_add(self.costs.step_cost(10, destination.cost_flags));
+                            if selected.is_none_or(|(old, _)| candidate < old) {
+                                selected = Some((candidate, east_west_mid));
+                            }
+                        }
+                    }
+                    if let Some((route_cost, (mid_x, mid_y))) = selected {
+                        out.push((to, route_cost, SearchAction::Diagonal(mid_x, mid_y)));
+                    }
+                } else {
+                    out.push((
+                        to,
+                        self.costs.step_cost(cost, destination.cost_flags),
+                        SearchAction::None,
+                    ));
+                }
             }
         }
         if let Some(nav_links) = self.nav_links_by_source.get(&(from.0, from.1)).cloned() {
             for nav_link in nav_links {
                 let to = (nav_link.destination.0, nav_link.destination.1);
-                if !self.can_occupy(to, pass_info)? {
+                let Some(destination) = self.occupiable_info(to, pass_info)? else {
                     continue;
-                }
+                };
                 tracy_span!("navmap.link_can_plan");
                 let allowed: ByondValue = call_global(
                     "navmap_pathfinder_link_can_plan",
                     [ByondValue::new_num(nav_link.id as f32), pass_info.clone()],
                 )?;
                 if truthy(&allowed) {
-                    out.push((to, nav_link.cost, SearchAction::NavLink(nav_link.id)));
+                    out.push((
+                        to,
+                        self.costs.step_cost(nav_link.cost, destination.cost_flags),
+                        SearchAction::NavLink(nav_link.id),
+                    ));
                 }
             }
         }

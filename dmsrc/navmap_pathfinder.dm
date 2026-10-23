@@ -41,13 +41,15 @@
 #define NAVMAP_PATH_NO_PATH "no_path"
 #define NAVMAP_PATH_ERROR "error"
 #define NAVMAP_PATH_STALE_TOPOLOGY "stale_topology"
+#define NAVMAP_PATH_STALE_COSTS "stale_costs"
+#define NAVMAP_PATHFINDER_VERSION "1.0.6"
 
 /** Synchronous call. Use this sparingly for long distances. */
-#define navmap_pathfinder(start, end, pass_info, is_flying, max_range, min_target_distance, simulated_only, avoid_turf, diagonal_handling, skip_first, allow_multiz, max_path_cost, allow_nav_links) \
-	NAVMAP_PATHFINDER_CALL(NAVMAP_PATHFINDER, "byond:navmap_pathfinder_ffi")(start, end, pass_info, is_flying, max_range, min_target_distance, simulated_only, avoid_turf, diagonal_handling, skip_first, allow_multiz, max_path_cost, allow_nav_links)
+#define navmap_pathfinder(start, end, pass_info, is_flying, max_range, min_target_distance, simulated_only, avoid_turf, diagonal_handling, skip_first, allow_multiz, max_path_cost, allow_nav_links, cost_modifiers) \
+	NAVMAP_PATHFINDER_CALL(NAVMAP_PATHFINDER, "byond:navmap_pathfinder_ffi")(start, end, pass_info, is_flying, max_range, min_target_distance, simulated_only, avoid_turf, diagonal_handling, skip_first, allow_multiz, max_path_cost, allow_nav_links, cost_modifiers)
 
-#define navmap_pathfinder_start(start, end, pass_info, is_flying, max_range, min_target_distance, simulated_only, avoid_turf, diagonal_handling, skip_first, allow_multiz, max_path_cost, allow_nav_links) \
-	NAVMAP_PATHFINDER_CALL(NAVMAP_PATHFINDER, "byond:navmap_pathfinder_start_ffi")(start, end, pass_info, is_flying, max_range, min_target_distance, simulated_only, avoid_turf, diagonal_handling, skip_first, allow_multiz, max_path_cost, allow_nav_links)
+#define navmap_pathfinder_start(start, end, pass_info, is_flying, max_range, min_target_distance, simulated_only, avoid_turf, diagonal_handling, skip_first, allow_multiz, max_path_cost, allow_nav_links, cost_modifiers) \
+	NAVMAP_PATHFINDER_CALL(NAVMAP_PATHFINDER, "byond:navmap_pathfinder_start_ffi")(start, end, pass_info, is_flying, max_range, min_target_distance, simulated_only, avoid_turf, diagonal_handling, skip_first, allow_multiz, max_path_cost, allow_nav_links, cost_modifiers)
 
 /** Resume an in-progress job. Re-supply the current mover pass_info. */
 #define navmap_pathfinder_resume(job_id, pass_info) \
@@ -57,8 +59,8 @@
 #define navmap_pathfinder_cancel(job_id) \
 	NAVMAP_PATHFINDER_CALL(NAVMAP_PATHFINDER, "byond:navmap_pathfinder_cancel_ffi")(job_id)
 
-#define navmap_update(x, y, z, nav_pass) \
-	NAVMAP_PATHFINDER_CALL(NAVMAP_PATHFINDER, "byond:navmap_update_ffi")(x, y, z, nav_pass)
+#define navmap_update(x, y, z, nav_pass, nav_cost_flags) \
+	NAVMAP_PATHFINDER_CALL(NAVMAP_PATHFINDER, "byond:navmap_update_ffi")(x, y, z, nav_pass, nav_cost_flags)
 
 #define navmap_bulk_update(flat_list) \
 	NAVMAP_PATHFINDER_CALL(NAVMAP_PATHFINDER, "byond:navmap_bulk_update_ffi")(flat_list)
@@ -82,14 +84,14 @@
 	catch
 		__navmap_pathfinder_available = FALSE
 		return FALSE
-	__navmap_pathfinder_available = !!version
+	__navmap_pathfinder_available = version == NAVMAP_PATHFINDER_VERSION
 	return __navmap_pathfinder_available
 
-/proc/navmap_pathfinder_update(x, y, z, nav_pass)
+/proc/navmap_pathfinder_update(x, y, z, nav_pass, nav_cost_flags)
 	if(!navmap_pathfinder_available())
 		return
 	try
-		navmap_update(x, y, z, nav_pass)
+		navmap_update(x, y, z, nav_pass, nav_cost_flags)
 	catch
 		return
 

@@ -1,7 +1,7 @@
 [package]
 name = "navmap-pathfinder"
 edition = "2024"
-version = "1.0.5"
+version = "1.0.6"
 authors = ["CabinetOnFire"]
 repository = "https://github.com/CabinetOnFire/navmap-pathfinder"
 license = "AGPL-3.0-only"

@@ -22,6 +22,7 @@ fn navmap_pathfinder_ffi(
     allow_multiz: ByondValue,
     max_path_cost: ByondValue,
     allow_nav_links: ByondValue,
+    cost_modifiers: ByondValue,
 ) -> Result<ByondValue, NavPathError> {
     tracy_span!("navmap.pathfinder_blocking");
     if truthy(&allow_multiz) {
@@ -38,6 +39,7 @@ fn navmap_pathfinder_ffi(
             skip_first,
             max_path_cost,
             allow_nav_links,
+            cost_modifiers,
         )?
         else {
             return status_response_with_actions(
@@ -62,6 +64,9 @@ fn navmap_pathfinder_ffi(
                 }
                 MultiJobProgress::Stale => {
                     return status_response("stale_topology", None, None, None);
+                }
+                MultiJobProgress::StaleCosts => {
+                    return status_response("stale_costs", None, None, None);
                 }
                 MultiJobProgress::Found(nodes, actions) => {
                     let (path, actions) = job.final_path(nodes, actions, &pass_info)?;
@@ -89,6 +94,7 @@ fn navmap_pathfinder_ffi(
         skip_first,
         max_path_cost,
         allow_nav_links,
+        cost_modifiers,
     )?
     else {
         return status_response_with_actions(
@@ -103,6 +109,7 @@ fn navmap_pathfinder_ffi(
         match job.step(&pass_info)? {
             SearchProgress::InProgress => continue,
             SearchProgress::Stale => return status_response("stale_topology", None, None, None),
+            SearchProgress::StaleCosts => return status_response("stale_costs", None, None, None),
             SearchProgress::NoPath => {
                 return status_response_with_actions(
                     "no_path",
@@ -144,6 +151,7 @@ fn navmap_pathfinder_start_ffi(
     allow_multiz: ByondValue,
     max_path_cost: ByondValue,
     allow_nav_links: ByondValue,
+    cost_modifiers: ByondValue,
 ) -> Result<ByondValue, NavPathError> {
     tracy_span!("navmap.pathfinder_start");
     let job_id = NEXT_JOB_ID.fetch_add(1, AtomicOrdering::Relaxed);
@@ -161,6 +169,7 @@ fn navmap_pathfinder_start_ffi(
             skip_first,
             max_path_cost,
             allow_nav_links,
+            cost_modifiers,
         )?
         else {
             return status_response("no_path", None, Some(empty_list()?), None);
@@ -191,6 +200,7 @@ fn navmap_pathfinder_start_ffi(
         skip_first,
         max_path_cost,
         allow_nav_links,
+        cost_modifiers,
     )?
     else {
         return status_response("no_path", None, Some(empty_list()?), None);
@@ -314,11 +324,13 @@ fn navmap_update_ffi(
     y: ByondValue,
     z: ByondValue,
     nav_pass: ByondValue,
+    nav_cost_flags: ByondValue,
 ) -> Result<ByondValue, NavPathError> {
-    // Replacing the cached packed value immediately prevents searches from using stale edges.
-    cache_nav_pass(
+    // Replacing cached values immediately prevents stale edges and terrain costs.
+    cache_nav_data(
         coords_from_values(&x, &y, &z)?,
         nav_pass.get_number()? as i32,
+        nav_cost_flags.get_number().unwrap_or(0.0).max(0.0) as u32,
     );
     Ok(ByondValue::NULL)
 }
@@ -328,14 +340,15 @@ fn navmap_update_ffi(
 #[allow(dead_code)]
 fn navmap_bulk_update_ffi(flat_list: ByondValue) -> Result<ByondValue, NavPathError> {
     let values = flat_list.read_list()?;
-    if !values.len().is_multiple_of(4) {
+    if !values.len().is_multiple_of(5) {
         return Err(NavPathError::InvalidBulkUpdateLength);
     }
-    // DM sends x, y, z, nav_pass tuples so a whole z-level can be published in one call.
-    for entry in values.chunks_exact(4) {
-        cache_nav_pass(
+    // DM sends x, y, z, nav_pass, and cost flags for every turf.
+    for entry in values.chunks_exact(5) {
+        cache_nav_data(
             coords_from_values(&entry[0], &entry[1], &entry[2])?,
             entry[3].get_number()? as i32,
+            entry[4].get_number().unwrap_or(0.0).max(0.0) as u32,
         );
     }
     Ok(ByondValue::NULL)
@@ -350,7 +363,7 @@ fn navmap_topology_update_ffi(
 ) -> Result<ByondValue, NavPathError> {
     let values = flat_list.read_list()?;
     if !values.len().is_multiple_of(3) {
-        return Err(NavPathError::InvalidBulkUpdateLength);
+        return Err(NavPathError::InvalidTopologyUpdateLength);
     }
     let mut topology = Topology {
         generation: generation.get_number().unwrap_or(0.0).max(0.0) as u64,
