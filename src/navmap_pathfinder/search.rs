@@ -423,6 +423,7 @@ impl SearchJob {
         }
         let goal = self.goal;
         let min_target_distance = self.min_target_distance;
+        let heuristic_scale = self.grid.costs.heuristic_scale;
         if !self.search.is_initialized() {
             if !self.grid.can_occupy(self.grid.start, pass_info)? {
                 return Ok(SearchProgress::NoPath);
@@ -431,17 +432,21 @@ impl SearchJob {
                 || heuristic_to_target_range(self.grid.start, goal, min_target_distance),
                 |heuristic| heuristic.estimate(self.grid.start),
             );
-            self.search.initialize(self.grid.start, estimate);
+            self.search.initialize(
+                self.grid.start,
+                CostProfile::scale_heuristic(estimate, heuristic_scale),
+            );
         }
         let progress = self.search.step(
             Some(self.grid.max_cost),
             |coord| chebyshev_distance(coord, goal) <= min_target_distance,
             |coord| self.grid.successors(coord, pass_info),
             |coord| {
-                self.heuristic.as_ref().map_or_else(
+                let estimate = self.heuristic.as_ref().map_or_else(
                     || heuristic_to_target_range(coord, goal, min_target_distance),
                     |heuristic| heuristic.estimate(coord),
-                )
+                );
+                CostProfile::scale_heuristic(estimate, heuristic_scale)
             },
         )?;
         if self.grid.costs.has_modifiers() && nav_cost_generation() != self.grid.cost_generation {

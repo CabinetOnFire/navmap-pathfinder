@@ -153,6 +153,8 @@ struct TurfInfo {
 struct CostProfile {
     modifiers: Vec<(u32, f32)>,
     combined: HashMap<u32, f32>,
+    /// Conservative lower bound for any terrain multiplier in this request.
+    heuristic_scale: f32,
 }
 
 impl CostProfile {
@@ -166,10 +168,10 @@ impl CostProfile {
             let flag_value = pair[0].get_number()?;
             let multiplier = pair[1].get_number()?;
             if !flag_value.is_finite()
-                || flag_value < 1.0
+                || flag_value <= 0.0
                 || flag_value.fract() != 0.0
                 || !multiplier.is_finite()
-                || multiplier < 1.0
+                || multiplier <= 0.0
             {
                 return Err(NavPathError::InvalidCostModifiers);
             }
@@ -179,9 +181,21 @@ impl CostProfile {
             }
             modifiers.push((flag, multiplier));
         }
+        let mut heuristic_scale = 1.0_f32;
+        for &(_, multiplier) in &modifiers {
+            if multiplier < 1.0 {
+                heuristic_scale *= multiplier;
+            }
+        }
+        if heuristic_scale > 0.0 && heuristic_scale < 1.0 {
+            // Round down one representable step so floating-point rounding cannot make the
+            // heuristic exceed the cheapest discounted movement cost.
+            heuristic_scale = f32::from_bits(heuristic_scale.to_bits() - 1);
+        }
         Ok(Self {
             modifiers,
             combined: HashMap::new(),
+            heuristic_scale,
         })
     }
 
@@ -200,7 +214,17 @@ impl CostProfile {
     }
 
     fn step_cost(&mut self, base: u32, flags: u32) -> u32 {
-        ((base as f32) * self.multiplier(flags)).ceil() as u32
+        if base == 0 {
+            return 0;
+        }
+        ((base as f32) * self.multiplier(flags)).ceil().max(1.0) as u32
+    }
+
+    fn scale_heuristic(estimate: u32, scale: f32) -> u32 {
+        if scale >= 1.0 {
+            return estimate;
+        }
+        ((estimate as f64) * (scale as f64)).floor() as u32
     }
 
     fn has_modifiers(&self) -> bool {
@@ -570,16 +594,10 @@ fn cached_nav_data(coords: TurfCoords) -> Option<CachedNavData> {
 }
 
 fn read_nav_cost_flags(turf: &ByondValue) -> Result<u32, NavPathError> {
-    Ok(turf
-        .read_var::<_, ByondValue>("nav_cost_flags")
-        .and_then(|value| value.get_number())
-        .map(|number| {
-            if number < 0.0 {
-                0
-            } else {
-                number as u32
-            }
-        })
+    let value: ByondValue = turf.call("get_nav_cost_flags", std::iter::empty::<ByondValue>())?;
+    Ok(value
+        .get_number()
+        .map(|number| if number < 0.0 { 0 } else { number as u32 })
         .unwrap_or(0))
 }
 

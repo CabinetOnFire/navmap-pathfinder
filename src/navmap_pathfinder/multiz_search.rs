@@ -387,12 +387,16 @@ impl MultiSearchJob {
         }
         let goal = self.goal;
         let min_target_distance = self.min_target_distance;
+        let heuristic_scale = self.grid.costs.heuristic_scale;
         if !self.search.is_initialized() {
             if !self.grid.can_occupy(self.grid.start, pass_info)? {
                 return Ok(MultiJobProgress::NoPath);
             }
             let estimate = self.heuristic.estimate(self.grid.start);
-            self.search.initialize(self.grid.start, estimate);
+            self.search.initialize(
+                self.grid.start,
+                CostProfile::scale_heuristic(estimate, heuristic_scale),
+            );
         }
         let progress = self.search.step(
             Some(self.grid.max_cost),
@@ -402,7 +406,7 @@ impl MultiSearchJob {
                     && chebyshev_distance((node.x, node.y), (goal.x, goal.y)) <= min_target_distance
             },
             |node| self.grid.successors(node, pass_info),
-            |node| self.heuristic.estimate(node),
+            |node| CostProfile::scale_heuristic(self.heuristic.estimate(node), heuristic_scale),
         )?;
         if self.grid.costs.has_modifiers() && nav_cost_generation() != self.grid.cost_generation {
             return Ok(MultiJobProgress::StaleCosts);
