@@ -20,7 +20,8 @@ impl Grid {
         let entry = match cached_nav_data(coords) {
             // Published baked data is authoritative for unconditional edges. Avoid crossing the BYOND FFI for the overwhelmingly common static-map case.
             Some(data) if data.nav_pass & BAKED_FLAG != 0 => {
-                if let Some((open_edges, _)) = cached_unconditional_edges(data.nav_pass, self.is_flying)
+                if let Some((open_edges, _)) =
+                    cached_unconditional_edges(data.nav_pass, self.is_flying)
                 {
                     Some(TurfInfo {
                         open_edges,
@@ -47,7 +48,8 @@ impl Grid {
                 if turf.is_null() {
                     None
                 } else {
-                    let (open_edges, nav_pass, cost_flags) = self.resolve_edges(coords, &turf, pass_info)?;
+                    let (open_edges, nav_pass, cost_flags) =
+                        self.resolve_edges(coords, &turf, pass_info)?;
                     Some(TurfInfo {
                         open_edges,
                         simulated: nav_pass_is_simulated(nav_pass),
@@ -209,7 +211,8 @@ impl Grid {
                     SearchAction::None,
                 ));
             } else {
-                let routes = self.diagonal_routes_from_source(source, from, to, pass_info, false)?;
+                let routes =
+                    self.diagonal_routes_from_source(source, from, to, pass_info, false)?;
                 if !routes.north_south_first && !routes.east_west_first {
                     continue;
                 }
@@ -228,7 +231,8 @@ impl Grid {
                         && let Some(mid) = self.occupiable_info(north_south_mid, pass_info)?
                     {
                         selected = Some((
-                            self.costs.step_cost(10, mid.cost_flags)
+                            self.costs
+                                .step_cost(10, mid.cost_flags)
                                 .saturating_add(self.costs.step_cost(10, destination.cost_flags)),
                             north_south_mid,
                         ));
@@ -236,7 +240,9 @@ impl Grid {
                     if routes.east_west_first
                         && let Some(mid) = self.occupiable_info(east_west_mid, pass_info)?
                     {
-                        let candidate = self.costs.step_cost(10, mid.cost_flags)
+                        let candidate = self
+                            .costs
+                            .step_cost(10, mid.cost_flags)
                             .saturating_add(self.costs.step_cost(10, destination.cost_flags));
                         if selected.is_none_or(|(old, _)| candidate < old) {
                             selected = Some((candidate, east_west_mid));

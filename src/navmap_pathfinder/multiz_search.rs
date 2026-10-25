@@ -270,14 +270,23 @@ impl LayeredGrid {
                     && !routes.north_south_first
                     && routes.east_west_first;
                 if expand_all || expand_clunky {
-                    let north_south_mid = LayeredNode { x: from.x, y: to.y, ..from };
-                    let east_west_mid = LayeredNode { x: to.x, y: from.y, ..from };
+                    let north_south_mid = LayeredNode {
+                        x: from.x,
+                        y: to.y,
+                        ..from
+                    };
+                    let east_west_mid = LayeredNode {
+                        x: to.x,
+                        y: from.y,
+                        ..from
+                    };
                     let mut selected: Option<(u32, LayeredNode)> = None;
                     if routes.north_south_first
                         && let Some(mid) = self.occupiable_info(north_south_mid, pass_info)?
                     {
                         selected = Some((
-                            self.costs.step_cost(10, mid.cost_flags)
+                            self.costs
+                                .step_cost(10, mid.cost_flags)
                                 .saturating_add(self.costs.step_cost(10, destination.cost_flags)),
                             north_south_mid,
                         ));
@@ -285,18 +294,16 @@ impl LayeredGrid {
                     if routes.east_west_first
                         && let Some(mid) = self.occupiable_info(east_west_mid, pass_info)?
                     {
-                        let candidate = self.costs.step_cost(10, mid.cost_flags)
+                        let candidate = self
+                            .costs
+                            .step_cost(10, mid.cost_flags)
                             .saturating_add(self.costs.step_cost(10, destination.cost_flags));
                         if selected.is_none_or(|(old, _)| candidate < old) {
                             selected = Some((candidate, east_west_mid));
                         }
                     }
                     if let Some((route_cost, mid)) = selected {
-                        out.push((
-                            to,
-                            route_cost,
-                            SearchAction::Diagonal(mid.x, mid.y),
-                        ));
+                        out.push((to, route_cost, SearchAction::Diagonal(mid.x, mid.y)));
                     }
                 } else {
                     out.push((
