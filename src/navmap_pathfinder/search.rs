@@ -68,7 +68,7 @@ pub(super) struct AStarCore<N> {
     sequence: u64,
 }
 
-impl<N> Default for AStarCore<N> {
+impl<N: Eq> Default for AStarCore<N> {
     fn default() -> Self {
         Self {
             frontier: BinaryHeap::new(),
