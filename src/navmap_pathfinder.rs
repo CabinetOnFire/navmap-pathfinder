@@ -401,6 +401,7 @@ struct LayeredGrid {
     cost_generation: u64,
 }
 
+/// Result of one multi-z search slice.
 enum MultiJobProgress {
     InProgress,
     Found(Vec<LayeredNode>, Vec<SearchAction>),
@@ -577,10 +578,12 @@ fn new_multi_search_job(
 }
 
 /// Reads one packed navmap value from the shared cache.
+#[cfg(test)]
 fn cached_nav_pass(coords: TurfCoords) -> Option<i32> {
     cached_nav_data(coords).map(|data| data.nav_pass)
 }
 
+#[cfg(test)]
 fn cached_nav_cost_flags(coords: TurfCoords) -> Option<u32> {
     cached_nav_data(coords).map(|data| data.nav_cost_flags)
 }
@@ -671,6 +674,7 @@ where
 }
 
 /// Stores one packed navmap value in the shared cache.
+#[cfg(test)]
 fn cache_nav_pass(coords: TurfCoords, nav_pass: i32) {
     let cost_flags = cached_nav_cost_flags(coords).unwrap_or(0);
     cache_nav_data(coords, nav_pass, cost_flags);

@@ -224,22 +224,22 @@ impl Grid {
                     && routes.east_west_first;
                 if expand_all || expand_clunky {
                     let mut selected: Option<(u32, Coord)> = None;
-                    if routes.north_south_first {
-                        if let Some(mid) = self.occupiable_info(north_south_mid, pass_info)? {
-                            selected = Some((
-                                self.costs.step_cost(10, mid.cost_flags)
-                                    .saturating_add(self.costs.step_cost(10, destination.cost_flags)),
-                                north_south_mid,
-                            ));
-                        }
+                    if routes.north_south_first
+                        && let Some(mid) = self.occupiable_info(north_south_mid, pass_info)?
+                    {
+                        selected = Some((
+                            self.costs.step_cost(10, mid.cost_flags)
+                                .saturating_add(self.costs.step_cost(10, destination.cost_flags)),
+                            north_south_mid,
+                        ));
                     }
-                    if routes.east_west_first {
-                        if let Some(mid) = self.occupiable_info(east_west_mid, pass_info)? {
-                            let candidate = self.costs.step_cost(10, mid.cost_flags)
-                                .saturating_add(self.costs.step_cost(10, destination.cost_flags));
-                            if selected.is_none_or(|(old, _)| candidate < old) {
-                                selected = Some((candidate, east_west_mid));
-                            }
+                    if routes.east_west_first
+                        && let Some(mid) = self.occupiable_info(east_west_mid, pass_info)?
+                    {
+                        let candidate = self.costs.step_cost(10, mid.cost_flags)
+                            .saturating_add(self.costs.step_cost(10, destination.cost_flags));
+                        if selected.is_none_or(|(old, _)| candidate < old) {
+                            selected = Some((candidate, east_west_mid));
                         }
                     }
                     if let Some((route_cost, (mid_x, mid_y))) = selected {

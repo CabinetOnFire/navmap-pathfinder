@@ -329,6 +329,8 @@ pub(super) fn diagonal_intermediate(
     }
 }
 
+type ExpandedPath<N> = (Vec<N>, Vec<SearchAction>);
+
 /// Expands diagonal nodes while preserving the action associated with each destination.
 pub(super) fn expand_path_diagonals<N, E, Coordinates, MakeIntermediate, CanExpand, Routes>(
     nodes: &[N],
@@ -338,7 +340,7 @@ pub(super) fn expand_path_diagonals<N, E, Coordinates, MakeIntermediate, CanExpa
     mut make_intermediate: MakeIntermediate,
     mut can_expand: CanExpand,
     mut routes_for: Routes,
-) -> Result<Option<(Vec<N>, Vec<SearchAction>)>, E>
+) -> Result<Option<ExpandedPath<N>>, E>
 where
     N: Copy,
     Coordinates: FnMut(N) -> Coord,
