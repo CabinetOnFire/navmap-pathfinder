@@ -460,11 +460,7 @@ fn evaluate_conditional_edge(
             Ok(value) if value.is_list() => value,
             _ => return Ok(true),
         };
-    let entries: Vec<_> = entries_list
-        .read_list()?
-        .into_iter()
-        .map(std::mem::ManuallyDrop::new)
-        .collect();
+    let entries = entries_list.read_list()?;
     let eval_dir = ByondValue::new_num(dir as f32);
     for entry in entries.iter() {
         if entry.is_number() {
@@ -474,7 +470,7 @@ fn evaluate_conditional_edge(
             continue;
         }
         // Resolve and evaluate in one DM callback, without a native loc read.
-        let result = turf.call("nav_blocker_can_pass", [&**entry, &eval_dir, pass_info])?;
+        let result = turf.call("nav_blocker_can_pass", [entry, &eval_dir, pass_info])?;
         if !truthy(&result) {
             return Ok(false);
         }

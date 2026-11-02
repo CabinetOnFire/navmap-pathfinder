@@ -42,7 +42,7 @@
 #define NAVMAP_PATH_ERROR "error"
 #define NAVMAP_PATH_STALE_TOPOLOGY "stale_topology"
 #define NAVMAP_PATH_STALE_COSTS "stale_costs"
-#define NAVMAP_PATHFINDER_VERSION "1.0.6"
+#define NAVMAP_PATHFINDER_VERSION "1.0.8"
 
 /** Synchronous call. Use this sparingly for long distances. */
 #define navmap_pathfinder(start, end, pass_info, is_flying, max_range, min_target_distance, simulated_only, avoid_turf, diagonal_handling, skip_first, allow_multiz, max_path_cost, allow_nav_links, cost_modifiers) \
