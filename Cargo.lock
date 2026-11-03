@@ -253,7 +253,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 [[package]]
 name = "meowtonin"
 version = "0.3.4"
-source = "git+https://github.com/CabinetOnFire/meowtonin.git?branch=reffix#17801c12fbfbcb1a9ff0520230da68a99bd7a573"
+source = "git+https://github.com/CabinetOnFire/meowtonin.git?branch=reffix#12acb254000758c7cf18b8f7373bfa59e4435649"
 dependencies = [
  "aho-corasick",
  "backtrace",
@@ -279,7 +279,7 @@ dependencies = [
 [[package]]
 name = "meowtonin-byondapi-sys"
 version = "0.3.4"
-source = "git+https://github.com/CabinetOnFire/meowtonin.git?branch=reffix#17801c12fbfbcb1a9ff0520230da68a99bd7a573"
+source = "git+https://github.com/CabinetOnFire/meowtonin.git?branch=reffix#12acb254000758c7cf18b8f7373bfa59e4435649"
 dependencies = [
  "bytemuck",
  "cfg-if",
@@ -289,7 +289,7 @@ dependencies = [
 [[package]]
 name = "meowtonin-impl"
 version = "0.3.4"
-source = "git+https://github.com/CabinetOnFire/meowtonin.git?branch=reffix#17801c12fbfbcb1a9ff0520230da68a99bd7a573"
+source = "git+https://github.com/CabinetOnFire/meowtonin.git?branch=reffix#12acb254000758c7cf18b8f7373bfa59e4435649"
 dependencies = [
  "darling",
  "proc-macro2",
@@ -308,7 +308,7 @@ dependencies = [
 
 [[package]]
 name = "navmap-pathfinder"
-version = "1.0.9"
+version = "1.0.10"
 dependencies = [
  "meowtonin",
  "thiserror",
