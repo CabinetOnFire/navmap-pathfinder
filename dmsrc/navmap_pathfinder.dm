@@ -42,7 +42,8 @@
 #define NAVMAP_PATH_ERROR "error"
 #define NAVMAP_PATH_STALE_TOPOLOGY "stale_topology"
 #define NAVMAP_PATH_STALE_COSTS "stale_costs"
-#define NAVMAP_PATHFINDER_VERSION "1.0.9"
+#define NAVMAP_PATH_STALE_PASS_FLAGS "stale_pass_flags"
+#define NAVMAP_PATHFINDER_VERSION "@CARGO_PKG_VERSION@"
 
 /** Synchronous call. Use this sparingly for long distances. */
 #define navmap_pathfinder(start, end, pass_info, is_flying, max_range, min_target_distance, simulated_only, avoid_turf, diagonal_handling, skip_first, allow_multiz, max_path_cost, allow_nav_links, cost_modifiers) \
@@ -68,8 +69,8 @@
 #define navmap_topology_update(generation, flat_list) \
 	NAVMAP_PATHFINDER_CALL(NAVMAP_PATHFINDER, "byond:navmap_topology_update_ffi")(generation, flat_list)
 
-#define navmap_links_update(flat_list) \
-	NAVMAP_PATHFINDER_CALL(NAVMAP_PATHFINDER, "byond:navmap_links_update_ffi")(flat_list)
+#define navmap_links_update(generation, flat_list) \
+	NAVMAP_PATHFINDER_CALL(NAVMAP_PATHFINDER, "byond:navmap_links_update_ffi")(generation, flat_list)
 
 // Cache the extension probe so a missing or unloadable library does not produce
 // repeated call_ext errors from the game.
@@ -111,16 +112,20 @@
 		result = navmap_topology_update(generation, flat_list)
 	catch
 		return FALSE
+	if(islist(result) && result["status"] == NAVMAP_PATH_ERROR)
+		return FALSE
 	var/success = isnum(result) && result == length(flat_list) / 3
 	return success
 
-/proc/navmap_pathfinder_links_update(list/flat_list)
+/proc/navmap_pathfinder_links_update(generation, list/flat_list)
 	if(!navmap_pathfinder_available())
 		return FALSE
 	var/result
 	try
-		result = navmap_links_update(flat_list)
+		result = navmap_links_update(generation, flat_list)
 	catch
+		return FALSE
+	if(islist(result) && result["status"] == NAVMAP_PATH_ERROR)
 		return FALSE
 	var/success = isnum(result) && result == length(flat_list) / 8
 	return success

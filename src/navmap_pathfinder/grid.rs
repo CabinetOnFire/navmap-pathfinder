@@ -17,6 +17,7 @@ impl Grid {
         }
 
         let coords = (x, y, self.z);
+        let observed_generation = nav_cost_generation();
         let entry = match cached_nav_data(coords) {
             // Published baked data is authoritative for unconditional edges. Avoid crossing the BYOND FFI for the overwhelmingly common static-map case.
             Some(data) if data.nav_pass & BAKED_FLAG != 0 => {
@@ -27,6 +28,7 @@ impl Grid {
                         open_edges,
                         simulated: nav_pass_is_simulated(data.nav_pass),
                         cost_flags: data.nav_cost_flags,
+                        cost_generation: observed_generation,
                     })
                 } else {
                     let turf = locate_xyz(ByondXYZ::new(x, y, self.z))?;
@@ -39,6 +41,7 @@ impl Grid {
                             open_edges,
                             simulated: nav_pass_is_simulated(nav_pass),
                             cost_flags,
+                            cost_generation: observed_generation,
                         })
                     }
                 }
@@ -54,6 +57,7 @@ impl Grid {
                         open_edges,
                         simulated: nav_pass_is_simulated(nav_pass),
                         cost_flags,
+                        cost_generation: observed_generation,
                     })
                 }
             }
@@ -82,8 +86,8 @@ impl Grid {
             if nav_pass & BAKED_FLAG == 0 {
                 return Ok((0, nav_pass, cost_flags));
             }
-            cache_nav_data(coords, nav_pass, cost_flags);
         }
+        cache_nav_data(coords, nav_pass, cost_flags);
 
         let (open, _) = resolve_packed_edges(nav_pass, self.is_flying, false, |dir| {
             evaluate_conditional_edge(turf, dir, self.pass_flags, pass_info)

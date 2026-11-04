@@ -3,7 +3,7 @@
 
 use meowtonin::misc::locate_xyz;
 use meowtonin::{ByondError, ByondValue, ByondXYZ, ToByond, call_global};
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::sync::{
     LazyLock, Mutex,
     atomic::{AtomicU64, Ordering as AtomicOrdering},
@@ -29,7 +29,7 @@ mod byond_api;
 mod grid;
 mod multiz_search;
 mod search;
-use search::{AStarCore, SearchProgress};
+use search::{AStarCore, NavLinkDistanceBuilder, SearchProgress};
 #[cfg(test)]
 #[path = "navmap_pathfinder/tests.rs"]
 mod tests;
@@ -82,11 +82,27 @@ struct CachedNavData {
     nav_cost_flags: u32,
 }
 
+#[derive(Clone, Copy)]
+struct CostChange {
+    generation: u64,
+    coords: TurfCoords,
+    changed_flags: u32,
+}
+
+#[derive(Default)]
+struct CostChangeHistory {
+    generation: u64,
+    changes: VecDeque<CostChange>,
+}
+
+const COST_CHANGE_HISTORY_LIMIT: usize = 65_536;
+
 /// Cached packed passability and terrain-cost values received from DM.
 static NAV_PASS_CACHE: LazyLock<Mutex<HashMap<TurfCoords, CachedNavData>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 /// Generation used to invalidate yielded searches after a published cost change.
-static NAV_COST_GENERATION: AtomicU64 = AtomicU64::new(0);
+static NAV_COST_CHANGES: LazyLock<Mutex<CostChangeHistory>> =
+    LazyLock::new(|| Mutex::new(CostChangeHistory::default()));
 /// Active single-z search jobs.
 static SEARCH_JOBS: LazyLock<Mutex<HashMap<u64, SearchJob>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -118,6 +134,12 @@ enum NavPathError {
     InvalidTopologyUpdateLength,
     #[error("nav cost modifiers must be flag/multiplier pairs")]
     InvalidCostModifiers,
+    #[error("pass info must contain numeric pass_flags")]
+    InvalidPassInfo,
+    #[error("navigation link records must contain valid numeric fields")]
+    InvalidNavLinks,
+    #[error("search range and path cost arguments must be finite nonnegative integers")]
+    InvalidSearchArgument,
 }
 
 /// Controls how diagonal steps are returned to DM.
@@ -137,6 +159,19 @@ impl DiagonalHandling {
             _ => Self::DoNothing,
         }
     }
+
+    fn validate(value: &ByondValue) -> Result<(), NavPathError> {
+        let mode = value
+            .get_number()
+            .map_err(|_| NavPathError::InvalidSearchArgument)?;
+        if !mode.is_finite()
+            || mode.fract() != 0.0
+            || !(DIAGONAL_DO_NOTHING..=DIAGONAL_REMOVE_CLUNKY).contains(&(mode as i32))
+        {
+            return Err(NavPathError::InvalidSearchArgument);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -147,6 +182,8 @@ struct TurfInfo {
     simulated: bool,
     /// Turf-level terrain modifier flags.
     cost_flags: u32,
+    /// Cost-data generation when this cache entry was read.
+    cost_generation: u64,
 }
 
 /// Per-search modifier weights and cached combined multipliers by turf flag combination.
@@ -230,6 +267,10 @@ impl CostProfile {
     fn has_modifiers(&self) -> bool {
         !self.modifiers.is_empty()
     }
+
+    fn modifier_mask(&self) -> u32 {
+        self.modifiers.iter().fold(0, |mask, (flag, _)| mask | flag)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -306,6 +347,8 @@ struct LayerLocation {
 struct Topology {
     /// Generation used to invalidate active searches.
     generation: u64,
+    /// Generation at which the navigation-link snapshot was last replaced.
+    links_generation: u64,
     /// Mapping from z-level to group/layer.
     z_to_layer: HashMap<i16, LayerLocation>,
     /// Reverse mapping from group/layer to z-level.
@@ -367,6 +410,7 @@ struct FlatNavLinkHeuristic {
     goal: Coord,
     min_target_distance: i32,
     source_distances: Vec<(Coord, u32)>,
+    builder: Option<NavLinkDistanceBuilder<Coord>>,
 }
 
 /// Multi-z search grid and its per-job cache.
@@ -408,6 +452,7 @@ enum MultiJobProgress {
     NoPath,
     Stale,
     StaleCosts,
+    StalePassFlags,
 }
 
 /// Resumable multi-z A* search state.
@@ -418,6 +463,8 @@ struct MultiSearchJob {
     goal: LayeredNode,
     /// Admissible lower-bound estimate including cross-z navigation links.
     heuristic: NavLinkHeuristic,
+    /// Pending incremental construction of the link-aware heuristic.
+    heuristic_builder: Option<NavLinkDistanceBuilder<LayeredNode>>,
     /// Acceptable distance from the target.
     min_target_distance: i32,
     /// Requested diagonal output mode.
@@ -441,6 +488,14 @@ fn topology_generation() -> u64 {
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .generation
+}
+
+/// Reads the generation of the native navigation-link snapshot.
+fn nav_link_generation() -> u64 {
+    TOPOLOGY
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .links_generation
 }
 
 /// Evaluates numeric masks and live weakrefs for one packed edge.
@@ -505,6 +560,7 @@ fn new_multi_search_job(
     allow_nav_links: ByondValue,
     cost_modifiers: ByondValue,
 ) -> Result<Option<MultiSearchJob>, NavPathError> {
+    DiagonalHandling::validate(&diagonal_handling)?;
     let start_xyz = start.xyz().ok_or(NavPathError::NotATurf)?;
     let end_xyz = end.xyz().ok_or(NavPathError::NotATurf)?;
     let topology = TOPOLOGY.lock().unwrap_or_else(|p| p.into_inner()).clone();
@@ -513,9 +569,9 @@ fn new_multi_search_job(
     let (Some(start_node), Some(goal_node)) = (start_node, goal_node) else {
         return Ok(None);
     };
-    let max_range = max_range.get_number().unwrap_or(0.0).max(0.0) as i32;
-    let min_target_distance = min_target_distance.get_number().unwrap_or(0.0).max(0.0) as i32;
-    let max_path_cost = max_path_cost.get_number().unwrap_or(0.0).max(0.0) as u32;
+    let max_range = byond_api::nonnegative_i32(&max_range)?;
+    let min_target_distance = byond_api::nonnegative_i32(&min_target_distance)?;
+    let max_path_cost = byond_api::nonnegative_u32(&max_path_cost)?;
     let costs = CostProfile::from_byond(&cost_modifiers)?;
     let cost_generation = nav_cost_generation();
     let avoid = if avoid_turf.is_null() {
@@ -524,11 +580,7 @@ fn new_multi_search_job(
         let xyz = avoid_turf.xyz().ok_or(NavPathError::NotATurf)?;
         node_for_xyz(&topology, xyz.x(), xyz.y(), xyz.z())
     };
-    let pass_flags = pass_info
-        .read_var::<_, ByondValue>("pass_flags")
-        .and_then(|value| value.get_number())
-        .map(|number| number as i32)
-        .unwrap_or(0);
+    let pass_flags = pass_flags_from_byond(pass_info)?;
     let allow_nav_links = truthy(&allow_nav_links);
     let nav_links_by_source = if allow_nav_links {
         NAV_LINKS_BY_SOURCE
@@ -539,6 +591,28 @@ fn new_multi_search_job(
         HashMap::new()
     };
     let nav_links: Vec<NavLink> = nav_links_by_source.values().flatten().copied().collect();
+    let heuristic_edges: Vec<_> = nav_links
+        .iter()
+        .filter_map(|nav_link| {
+            Some((
+                node_for_xyz(
+                    &topology,
+                    nav_link.source.0,
+                    nav_link.source.1,
+                    nav_link.source.2,
+                )?,
+                node_for_xyz(
+                    &topology,
+                    nav_link.destination.0,
+                    nav_link.destination.1,
+                    nav_link.destination.2,
+                )?,
+                nav_link.cost,
+            ))
+        })
+        .collect();
+    let heuristic_builder = (!heuristic_edges.is_empty())
+        .then(|| NavLinkDistanceBuilder::new(goal_node, min_target_distance, heuristic_edges));
     let is_flying = truthy(&is_flying);
     Ok(Some(MultiSearchJob {
         grid: LayeredGrid {
@@ -558,13 +632,13 @@ fn new_multi_search_job(
             cost_generation,
         },
         goal: goal_node,
-        heuristic: NavLinkHeuristic::new(
-            &topology,
+        heuristic: NavLinkHeuristic::from_source_distances(
             goal_node,
             min_target_distance,
             is_flying,
-            &nav_links,
+            Vec::new(),
         ),
+        heuristic_builder,
         min_target_distance,
         diagonal_handling: DiagonalHandling::from_byond(&diagonal_handling),
         skip_first: truthy(&skip_first),
@@ -601,7 +675,63 @@ fn read_nav_cost_flags(turf: &ByondValue) -> Result<u32, NavPathError> {
 }
 
 fn nav_cost_generation() -> u64 {
-    NAV_COST_GENERATION.load(AtomicOrdering::Acquire)
+    NAV_COST_CHANGES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .generation
+}
+
+/// Returns the latest cost generation, or None when required history has expired or a relevant
+/// observed turf changed under one of this search's modifiers.
+fn cost_generation_since<ObservedGeneration>(
+    generation: u64,
+    modifier_mask: u32,
+    mut observed_generation: ObservedGeneration,
+) -> Option<u64>
+where
+    ObservedGeneration: FnMut(TurfCoords) -> Option<u64>,
+{
+    let history = NAV_COST_CHANGES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if history
+        .changes
+        .front()
+        .is_some_and(|change| generation.saturating_add(1) < change.generation)
+    {
+        return None;
+    }
+    for change in history
+        .changes
+        .iter()
+        .filter(|change| change.generation > generation)
+    {
+        if change.changed_flags & modifier_mask != 0
+            && observed_generation(change.coords)
+                .is_some_and(|seen_generation| seen_generation < change.generation)
+        {
+            return None;
+        }
+    }
+    Some(history.generation)
+}
+
+/// Reads the mover's conditional blocker flags from a BYOND pass profile.
+fn pass_flags_from_byond(pass_info: &ByondValue) -> Result<i32, NavPathError> {
+    let value = pass_info
+        .read_var::<_, ByondValue>("pass_flags")
+        .map_err(|_| NavPathError::InvalidPassInfo)?;
+    let flags = value
+        .get_number()
+        .map_err(|_| NavPathError::InvalidPassInfo)?;
+    if !flags.is_finite()
+        || flags.fract() != 0.0
+        || flags < i32::MIN as f32
+        || flags > i32::MAX as f32
+    {
+        return Err(NavPathError::InvalidPassInfo);
+    }
+    Ok(flags as i32)
 }
 
 /// Decodes cached baked edges when no live conditional blocker lookup is needed.
@@ -690,8 +820,24 @@ fn cache_nav_data(coords: TurfCoords, nav_pass: i32, nav_cost_flags: u32) {
             nav_cost_flags,
         },
     );
-    if previous.is_some_and(|data| data.nav_cost_flags != nav_cost_flags) {
-        NAV_COST_GENERATION.fetch_add(1, AtomicOrdering::Release);
+    drop(cache);
+    if let Some(previous) = previous {
+        let changed_flags = previous.nav_cost_flags ^ nav_cost_flags;
+        if changed_flags != 0 {
+            let mut history = NAV_COST_CHANGES
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            history.generation = history.generation.saturating_add(1);
+            let generation = history.generation;
+            history.changes.push_back(CostChange {
+                generation,
+                coords,
+                changed_flags,
+            });
+            while history.changes.len() > COST_CHANGE_HISTORY_LIMIT {
+                history.changes.pop_front();
+            }
+        }
     }
 }
 
@@ -891,6 +1037,10 @@ fn run_job(
             None,
             status_response("stale_costs", Some(job_id), None, None)?,
         )),
+        SearchProgress::StalePassFlags => Ok((
+            None,
+            status_response("stale_pass_flags", Some(job_id), None, None)?,
+        )),
         SearchProgress::NoPath => Ok((
             None,
             status_response_with_actions(
@@ -903,6 +1053,9 @@ fn run_job(
         )),
         SearchProgress::Found(nodes, actions) => {
             let (path, actions) = job.final_path(nodes, actions, pass_info)?;
+            if let Some(status) = job.final_stale_status(pass_info)? {
+                return Ok((None, status_response(status, Some(job_id), None, None)?));
+            }
             Ok((
                 None,
                 status_response_with_actions("complete", None, Some(path), Some(actions), None)?,
@@ -930,6 +1083,10 @@ fn run_multi_job(
             None,
             status_response("stale_costs", Some(job_id), None, None)?,
         )),
+        MultiJobProgress::StalePassFlags => Ok((
+            None,
+            status_response("stale_pass_flags", Some(job_id), None, None)?,
+        )),
         MultiJobProgress::NoPath => Ok((
             None,
             status_response_with_actions(
@@ -942,6 +1099,9 @@ fn run_multi_job(
         )),
         MultiJobProgress::Found(nodes, actions) => {
             let (path, actions) = job.final_path(nodes, actions, pass_info)?;
+            if let Some(status) = job.final_stale_status(pass_info)? {
+                return Ok((None, status_response(status, Some(job_id), None, None)?));
+            }
             Ok((
                 None,
                 status_response_with_actions("complete", None, Some(path), Some(actions), None)?,
@@ -967,6 +1127,7 @@ fn new_search_job(
     allow_nav_links: ByondValue,
     cost_modifiers: ByondValue,
 ) -> Result<Option<SearchJob>, NavPathError> {
+    DiagonalHandling::validate(&diagonal_handling)?;
     let start_xyz = start.xyz().ok_or(NavPathError::NotATurf)?;
     let end_xyz = end.xyz().ok_or(NavPathError::NotATurf)?;
     let (sx, sy, sz) = (start_xyz.x(), start_xyz.y(), start_xyz.z());
@@ -974,9 +1135,9 @@ fn new_search_job(
     if sz != ez {
         return Err(NavPathError::DifferentZLevels);
     }
-    let max_range = max_range.get_number().unwrap_or(0.0).max(0.0) as i32;
-    let min_target_distance = min_target_distance.get_number().unwrap_or(0.0).max(0.0) as i32;
-    let max_path_cost = max_path_cost.get_number().unwrap_or(0.0).max(0.0) as u32;
+    let max_range = byond_api::nonnegative_i32(&max_range)?;
+    let min_target_distance = byond_api::nonnegative_i32(&min_target_distance)?;
+    let max_path_cost = byond_api::nonnegative_u32(&max_path_cost)?;
     let costs = CostProfile::from_byond(&cost_modifiers)?;
     let cost_generation = nav_cost_generation();
     let avoid = if avoid_turf.is_null() {
@@ -995,11 +1156,7 @@ fn new_search_job(
         // reached within max_range.
         return Ok(None);
     }
-    let pass_flags = pass_info
-        .read_var::<_, ByondValue>("pass_flags")
-        .and_then(|value| value.get_number())
-        .map(|number| number as i32)
-        .unwrap_or(0);
+    let pass_flags = pass_flags_from_byond(pass_info)?;
     let mut nav_links_by_source: HashMap<Coord, Vec<NavLink>> = HashMap::new();
     if truthy(&allow_nav_links) {
         let nav_links_by_world_source = NAV_LINKS_BY_SOURCE
@@ -1020,9 +1177,23 @@ fn new_search_job(
         }
     }
     let nav_links: Vec<NavLink> = nav_links_by_source.values().flatten().copied().collect();
-    let topology_generation = (!nav_links.is_empty()).then(topology_generation);
-    let heuristic = (!nav_links.is_empty())
-        .then(|| FlatNavLinkHeuristic::new((ex, ey), min_target_distance, &nav_links));
+    let heuristic_edges: Vec<_> = nav_links
+        .iter()
+        .map(|nav_link| {
+            (
+                (nav_link.source.0, nav_link.source.1),
+                (nav_link.destination.0, nav_link.destination.1),
+                nav_link.cost,
+            )
+        })
+        .collect();
+    let heuristic_builder = (!heuristic_edges.is_empty())
+        .then(|| NavLinkDistanceBuilder::new((ex, ey), min_target_distance, heuristic_edges));
+    let topology_generation = truthy(&allow_nav_links).then(topology_generation);
+    let heuristic = heuristic_builder.map(|builder| {
+        FlatNavLinkHeuristic::from_source_distances((ex, ey), min_target_distance, Vec::new())
+            .with_builder(builder)
+    });
     Ok(Some(SearchJob::new(
         Grid {
             z: sz,

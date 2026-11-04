@@ -2,6 +2,7 @@
 
 use super::*;
 use std::cmp::Ordering;
+use std::collections::HashSet;
 use std::hash::Hash;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -57,6 +58,7 @@ pub(super) enum SearchProgress<N> {
     NoPath,
     Stale,
     StaleCosts,
+    StalePassFlags,
 }
 
 /// Shared A* frontier, cost relaxation, stale-entry handling, and path reconstruction.
@@ -85,8 +87,31 @@ where
     N: Copy + Eq + Hash,
 {
     /// Advances one statically dispatched A* slice over a specialized grid.
+    #[cfg(test)]
     pub(super) fn step<E, IsGoal, Successors, Heuristic>(
         &mut self,
+        max_cost: Option<u32>,
+        is_goal: IsGoal,
+        successors: Successors,
+        heuristic: Heuristic,
+    ) -> Result<SearchProgress<N>, E>
+    where
+        IsGoal: FnMut(N) -> bool,
+        Successors: FnMut(N) -> Result<Vec<(N, u32, SearchAction)>, E>,
+        Heuristic: FnMut(N) -> u32,
+    {
+        self.step_until(
+            Instant::now() + SLICE_BUDGET,
+            max_cost,
+            is_goal,
+            successors,
+            heuristic,
+        )
+    }
+
+    pub(super) fn step_until<E, IsGoal, Successors, Heuristic>(
+        &mut self,
+        deadline: Instant,
         max_cost: Option<u32>,
         mut is_goal: IsGoal,
         mut successors: Successors,
@@ -97,8 +122,7 @@ where
         Successors: FnMut(N) -> Result<Vec<(N, u32, SearchAction)>, E>,
         Heuristic: FnMut(N) -> u32,
     {
-        let started = Instant::now();
-        while started.elapsed() < SLICE_BUDGET {
+        while Instant::now() < deadline {
             let Some(current) = self.frontier.pop() else {
                 return Ok(SearchProgress::NoPath);
             };
@@ -163,77 +187,143 @@ where
     }
 }
 
-/// Builds relaxed source-to-goal estimates for directed navigation links.
-pub(super) fn nav_link_source_distances<N, Relaxed>(
+/// Incrementally builds relaxed source-to-goal estimates for directed navigation links.
+pub(super) struct NavLinkDistanceBuilder<N> {
     goal: N,
     min_target_distance: i32,
-    nav_link_edges: &[(N, N, u32)],
-    mut relaxed_distance: Relaxed,
-) -> Vec<(N, u32)>
+    edges: Vec<(N, N, u32)>,
+    nodes: Vec<N>,
+    node_set: HashSet<N>,
+    distances: HashMap<N, u32>,
+    frontier: BinaryHeap<NavLinkQueueEntry<N>>,
+    sequence: u64,
+    collect_index: usize,
+    seed_index: usize,
+    current: Option<NavLinkQueueEntry<N>>,
+    candidate_index: usize,
+    edge_index: usize,
+    source_distances: Option<Vec<(N, u32)>>,
+}
+
+impl<N> NavLinkDistanceBuilder<N>
 where
     N: Copy + Eq + Hash,
-    Relaxed: FnMut(N, N, i32) -> Option<u32>,
 {
-    let mut nav_links = vec![goal];
-    for &(source, destination, _) in nav_link_edges {
-        if !nav_links.contains(&source) {
-            nav_links.push(source);
-        }
-        if !nav_links.contains(&destination) {
-            nav_links.push(destination);
-        }
+    pub(super) fn new(goal: N, min_target_distance: i32, edges: Vec<(N, N, u32)>) -> Self {
+        let mut builder = Self {
+            goal,
+            min_target_distance,
+            edges,
+            nodes: Vec::new(),
+            node_set: HashSet::new(),
+            distances: HashMap::new(),
+            frontier: BinaryHeap::new(),
+            sequence: 0,
+            collect_index: 0,
+            seed_index: 0,
+            current: None,
+            candidate_index: 0,
+            edge_index: 0,
+            source_distances: None,
+        };
+        builder.node_set.insert(goal);
+        builder.nodes.push(goal);
+        builder
     }
 
-    let mut distances = HashMap::new();
-    let mut frontier = BinaryHeap::new();
-    let mut sequence = 0;
-    for &nav_link in &nav_links {
-        if let Some(cost) = relaxed_distance(nav_link, goal, min_target_distance)
-            && distances.get(&nav_link).is_none_or(|&old| cost < old)
-        {
-            distances.insert(nav_link, cost);
-            sequence += 1;
-            frontier.push(NavLinkQueueEntry {
-                node: nav_link,
-                cost,
-                sequence,
-            });
-        }
-    }
-
-    while let Some(current) = frontier.pop() {
-        if distances.get(&current.node).copied() != Some(current.cost) {
-            continue;
-        }
-        for &candidate in &nav_links {
-            let Some(edge_cost) = relaxed_distance(candidate, current.node, 0) else {
+    /// Returns true when all link estimates are ready.
+    pub(super) fn advance<Relaxed>(
+        &mut self,
+        deadline: Instant,
+        mut relaxed_distance: Relaxed,
+    ) -> bool
+    where
+        Relaxed: FnMut(N, N, i32) -> Option<u32>,
+    {
+        while Instant::now() < deadline {
+            if self.collect_index < self.edges.len() {
+                let (source, destination, _) = self.edges[self.collect_index];
+                self.collect_index += 1;
+                if self.node_set.insert(source) {
+                    self.nodes.push(source);
+                }
+                if self.node_set.insert(destination) {
+                    self.nodes.push(destination);
+                }
+                continue;
+            }
+            if self.seed_index < self.nodes.len() {
+                let node = self.nodes[self.seed_index];
+                self.seed_index += 1;
+                if let Some(cost) = relaxed_distance(node, self.goal, self.min_target_distance) {
+                    relax_nav_link_distance(
+                        node,
+                        cost,
+                        &mut self.distances,
+                        &mut self.frontier,
+                        &mut self.sequence,
+                    );
+                }
+                continue;
+            }
+            if self.current.is_none() {
+                let Some(current) = self.frontier.pop() else {
+                    self.source_distances = Some(
+                        self.edges
+                            .iter()
+                            .filter_map(|&(source, _, _)| {
+                                Some((source, *self.distances.get(&source)?))
+                            })
+                            .collect(),
+                    );
+                    return true;
+                };
+                if self.distances.get(&current.node).copied() != Some(current.cost) {
+                    continue;
+                }
+                self.current = Some(current);
+                self.candidate_index = 0;
+                self.edge_index = 0;
+            }
+            let Some(current) = self.current else {
                 continue;
             };
-            relax_nav_link_distance(
-                candidate,
-                current.cost.saturating_add(edge_cost),
-                &mut distances,
-                &mut frontier,
-                &mut sequence,
-            );
-        }
-        for &(source, destination, nav_link_cost) in nav_link_edges {
-            if destination == current.node {
-                relax_nav_link_distance(
-                    source,
-                    current.cost.saturating_add(nav_link_cost),
-                    &mut distances,
-                    &mut frontier,
-                    &mut sequence,
-                );
+            if self.candidate_index < self.nodes.len() {
+                let candidate = self.nodes[self.candidate_index];
+                self.candidate_index += 1;
+                if let Some(edge_cost) = relaxed_distance(candidate, current.node, 0) {
+                    relax_nav_link_distance(
+                        candidate,
+                        current.cost.saturating_add(edge_cost),
+                        &mut self.distances,
+                        &mut self.frontier,
+                        &mut self.sequence,
+                    );
+                }
+                continue;
             }
+            if self.edge_index < self.edges.len() {
+                let (source, destination, link_cost) = self.edges[self.edge_index];
+                self.edge_index += 1;
+                if destination == current.node {
+                    relax_nav_link_distance(
+                        source,
+                        current.cost.saturating_add(link_cost),
+                        &mut self.distances,
+                        &mut self.frontier,
+                        &mut self.sequence,
+                    );
+                }
+                continue;
+            }
+            self.current = None;
         }
+        false
     }
 
-    nav_link_edges
-        .iter()
-        .filter_map(|&(source, _, _)| Some((source, *distances.get(&source)?)))
-        .collect()
+    pub(super) fn finish(self) -> Option<Vec<(N, u32)>> {
+        self.source_distances
+    }
 }
 
 fn relax_nav_link_distance<N: Copy + Eq + Hash>(
@@ -266,37 +356,34 @@ where
     N: Copy,
     Relaxed: FnMut(N, N, i32) -> Option<u32>,
 {
-    let mut best = relaxed_distance(node, goal, min_target_distance).unwrap_or(0);
+    let mut best = relaxed_distance(node, goal, min_target_distance);
     for &(source, distance) in source_distances {
         let Some(to_source) = relaxed_distance(node, source, 0) else {
             continue;
         };
-        best = best.min(to_source.saturating_add(distance));
+        let through_link = to_source.saturating_add(distance);
+        best = Some(best.map_or(through_link, |estimate| estimate.min(through_link)));
     }
-    best
+    best.unwrap_or(0)
 }
 
 impl FlatNavLinkHeuristic {
-    pub(super) fn new(goal: Coord, min_target_distance: i32, nav_links: &[NavLink]) -> Self {
-        let edges: Vec<_> = nav_links
-            .iter()
-            .map(|nav_link| {
-                (
-                    (nav_link.source.0, nav_link.source.1),
-                    (nav_link.destination.0, nav_link.destination.1),
-                    nav_link.cost,
-                )
-            })
-            .collect();
-        let source_distances =
-            nav_link_source_distances(goal, min_target_distance, &edges, |from, to, distance| {
-                Some(heuristic_to_target_range(from, to, distance))
-            });
+    pub(super) fn from_source_distances(
+        goal: Coord,
+        min_target_distance: i32,
+        source_distances: Vec<(Coord, u32)>,
+    ) -> Self {
         Self {
             goal,
             min_target_distance,
             source_distances,
+            builder: None,
         }
+    }
+
+    pub(super) fn with_builder(mut self, builder: NavLinkDistanceBuilder<Coord>) -> Self {
+        self.builder = Some(builder);
+        self
     }
 
     pub(super) fn estimate(&self, node: Coord) -> u32 {
@@ -385,6 +472,48 @@ where
 }
 
 impl SearchJob {
+    pub(super) fn cost_changes_stale(&mut self) -> bool {
+        if !self.grid.costs.has_modifiers() {
+            return false;
+        }
+        let grid = &self.grid;
+        let Some(generation) = cost_generation_since(
+            self.grid.cost_generation,
+            self.grid.costs.modifier_mask(),
+            |(x, y, z)| {
+                if z != grid.z {
+                    return None;
+                }
+                grid.cache
+                    .get(&(x, y))
+                    .and_then(|info| info.as_ref())
+                    .map(|info| info.cost_generation)
+            },
+        ) else {
+            return true;
+        };
+        self.grid.cost_generation = generation;
+        false
+    }
+
+    pub(super) fn final_stale_status(
+        &mut self,
+        pass_info: &ByondValue,
+    ) -> Result<Option<&'static str>, NavPathError> {
+        if self.topology_generation.is_some_and(|generation| {
+            topology_generation() != generation || nav_link_generation() != generation
+        }) {
+            return Ok(Some("stale_topology"));
+        }
+        if pass_flags_from_byond(pass_info)? != self.grid.pass_flags {
+            return Ok(Some("stale_pass_flags"));
+        }
+        if self.cost_changes_stale() {
+            return Ok(Some("stale_costs"));
+        }
+        Ok(None)
+    }
+
     /// Creates a single-z search with the shared generic A* core.
     pub(super) fn new(
         grid: Grid,
@@ -414,14 +543,37 @@ impl SearchJob {
         pass_info: &ByondValue,
     ) -> Result<SearchProgress<Coord>, NavPathError> {
         self.last_touched = Instant::now();
-        if self
-            .topology_generation
-            .is_some_and(|generation| topology_generation() != generation)
-        {
+        if self.topology_generation.is_some_and(|generation| {
+            topology_generation() != generation || nav_link_generation() != generation
+        }) {
             return Ok(SearchProgress::Stale);
         }
-        if self.grid.costs.has_modifiers() && nav_cost_generation() != self.grid.cost_generation {
+        if pass_flags_from_byond(pass_info)? != self.grid.pass_flags {
+            return Ok(SearchProgress::StalePassFlags);
+        }
+        if self.cost_changes_stale() {
             return Ok(SearchProgress::StaleCosts);
+        }
+        let deadline = Instant::now() + SLICE_BUDGET;
+        if let Some(heuristic) = &mut self.heuristic {
+            let heuristic_ready = if let Some(builder) = &mut heuristic.builder {
+                builder.advance(deadline, |from, to, distance| {
+                    Some(heuristic_to_target_range(from, to, distance))
+                })
+            } else {
+                true
+            };
+            if !heuristic_ready {
+                return Ok(SearchProgress::InProgress);
+            }
+            if heuristic.builder.is_some() {
+                heuristic.source_distances = heuristic
+                    .builder
+                    .take()
+                    .and_then(NavLinkDistanceBuilder::finish)
+                    .unwrap_or_default();
+                heuristic.builder = None;
+            }
         }
         let goal = self.goal;
         let min_target_distance = self.min_target_distance;
@@ -439,7 +591,8 @@ impl SearchJob {
                 CostProfile::scale_heuristic(estimate, heuristic_scale),
             );
         }
-        let progress = self.search.step(
+        let progress = self.search.step_until(
+            deadline,
             Some(self.grid.max_cost),
             |coord| chebyshev_distance(coord, goal) <= min_target_distance,
             |coord| self.grid.successors(coord, pass_info),
@@ -451,7 +604,7 @@ impl SearchJob {
                 CostProfile::scale_heuristic(estimate, heuristic_scale)
             },
         )?;
-        if self.grid.costs.has_modifiers() && nav_cost_generation() != self.grid.cost_generation {
+        if self.cost_changes_stale() {
             return Ok(SearchProgress::StaleCosts);
         }
         Ok(progress)

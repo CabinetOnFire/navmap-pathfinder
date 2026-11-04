@@ -1,40 +1,15 @@
 //! Layered topology traversal and resumable multi-z A* search.
 
-use super::search::{expand_path_diagonals, nav_link_estimate, nav_link_source_distances};
+use super::search::{expand_path_diagonals, nav_link_estimate};
 use super::*;
 
 impl NavLinkHeuristic {
-    pub(super) fn new(
-        topology: &Topology,
+    pub(super) fn from_source_distances(
         goal: LayeredNode,
         min_target_distance: i32,
         is_flying: bool,
-        nav_links: &[NavLink],
+        source_distances: Vec<(LayeredNode, u32)>,
     ) -> Self {
-        let edges: Vec<_> = nav_links
-            .iter()
-            .filter_map(|nav_link| {
-                Some((
-                    node_for_xyz(
-                        topology,
-                        nav_link.source.0,
-                        nav_link.source.1,
-                        nav_link.source.2,
-                    )?,
-                    node_for_xyz(
-                        topology,
-                        nav_link.destination.0,
-                        nav_link.destination.1,
-                        nav_link.destination.2,
-                    )?,
-                    nav_link.cost,
-                ))
-            })
-            .collect();
-        let source_distances =
-            nav_link_source_distances(goal, min_target_distance, &edges, |from, to, distance| {
-                relaxed_distance(from, to, distance, is_flying)
-            });
         Self {
             goal,
             min_target_distance,
@@ -78,6 +53,7 @@ impl LayeredGrid {
             return Ok(None);
         };
         let coords = (node.x, node.y, z);
+        let observed_generation = nav_cost_generation();
         let entry = match cached_nav_data(coords) {
             Some(data) if data.nav_pass & BAKED_FLAG != 0 => {
                 if let Some((open_edges, vertical_open)) =
@@ -87,6 +63,7 @@ impl LayeredGrid {
                         open_edges: open_edges | (vertical_open << 24),
                         simulated: nav_pass_is_simulated(data.nav_pass),
                         cost_flags: data.nav_cost_flags,
+                        cost_generation: observed_generation,
                     })
                 } else {
                     let turf = locate_xyz(ByondXYZ::new(node.x, node.y, z))?;
@@ -99,6 +76,7 @@ impl LayeredGrid {
                             open_edges: open_edges | (vertical_open << 24),
                             simulated: nav_pass_is_simulated(nav_pass),
                             cost_flags,
+                            cost_generation: observed_generation,
                         })
                     }
                 }
@@ -114,6 +92,7 @@ impl LayeredGrid {
                         open_edges: open_edges | (vertical_open << 24),
                         simulated: nav_pass_is_simulated(nav_pass),
                         cost_flags,
+                        cost_generation: observed_generation,
                     })
                 }
             }
@@ -141,8 +120,8 @@ impl LayeredGrid {
             if nav_pass & BAKED_FLAG == 0 {
                 return Ok((0, 0, nav_pass, cost_flags));
             }
-            cache_nav_data(coords, nav_pass, cost_flags);
         }
+        cache_nav_data(coords, nav_pass, cost_flags);
         let (open, vertical) = resolve_packed_edges(nav_pass, self.is_flying, true, |dir| {
             evaluate_conditional_edge(turf, dir, self.pass_flags, pass_info)
         })?;
@@ -377,6 +356,52 @@ impl LayeredGrid {
 }
 
 impl MultiSearchJob {
+    pub(super) fn cost_changes_stale(&mut self) -> bool {
+        if !self.grid.costs.has_modifiers() {
+            return false;
+        }
+        let grid = &self.grid;
+        let Some(generation) = cost_generation_since(
+            self.grid.cost_generation,
+            self.grid.costs.modifier_mask(),
+            |(x, y, z)| {
+                let layer = grid.topology.z_to_layer.get(&z)?;
+                let node = LayeredNode {
+                    group: layer.group,
+                    layer: layer.layer,
+                    x,
+                    y,
+                };
+                grid.cache
+                    .get(&node)?
+                    .as_ref()
+                    .map(|info| info.cost_generation)
+            },
+        ) else {
+            return true;
+        };
+        self.grid.cost_generation = generation;
+        false
+    }
+
+    pub(super) fn final_stale_status(
+        &mut self,
+        pass_info: &ByondValue,
+    ) -> Result<Option<&'static str>, NavPathError> {
+        if topology_generation() != self.grid.topology.generation
+            || (self.grid.allow_nav_links && nav_link_generation() != self.grid.topology.generation)
+        {
+            return Ok(Some("stale_topology"));
+        }
+        if pass_flags_from_byond(pass_info)? != self.grid.pass_flags {
+            return Ok(Some("stale_pass_flags"));
+        }
+        if self.cost_changes_stale() {
+            return Ok(Some("stale_costs"));
+        }
+        Ok(None)
+    }
+
     /// Advances the search for one time slice.
     pub(super) fn step(
         &mut self,
@@ -387,8 +412,32 @@ impl MultiSearchJob {
         if topology_generation() != self.grid.topology.generation {
             return Ok(MultiJobProgress::Stale);
         }
-        if self.grid.costs.has_modifiers() && nav_cost_generation() != self.grid.cost_generation {
+        if self.grid.allow_nav_links && nav_link_generation() != self.grid.topology.generation {
+            return Ok(MultiJobProgress::Stale);
+        }
+        if pass_flags_from_byond(pass_info)? != self.grid.pass_flags {
+            return Ok(MultiJobProgress::StalePassFlags);
+        }
+        if self.cost_changes_stale() {
             return Ok(MultiJobProgress::StaleCosts);
+        }
+        let deadline = Instant::now() + SLICE_BUDGET;
+        if let Some(builder) = &mut self.heuristic_builder {
+            let is_flying = self.grid.is_flying;
+            if !builder.advance(deadline, |from, to, distance| {
+                relaxed_distance(from, to, distance, is_flying)
+            }) {
+                return Ok(MultiJobProgress::InProgress);
+            }
+            self.heuristic = NavLinkHeuristic::from_source_distances(
+                self.goal,
+                self.min_target_distance,
+                self.grid.is_flying,
+                self.heuristic_builder
+                    .take()
+                    .and_then(NavLinkDistanceBuilder::finish)
+                    .unwrap_or_default(),
+            );
         }
         let goal = self.goal;
         let min_target_distance = self.min_target_distance;
@@ -403,7 +452,8 @@ impl MultiSearchJob {
                 CostProfile::scale_heuristic(estimate, heuristic_scale),
             );
         }
-        let progress = self.search.step(
+        let progress = self.search.step_until(
+            deadline,
             Some(self.grid.max_cost),
             |node| {
                 node.group == goal.group
@@ -413,7 +463,7 @@ impl MultiSearchJob {
             |node| self.grid.successors(node, pass_info),
             |node| CostProfile::scale_heuristic(self.heuristic.estimate(node), heuristic_scale),
         )?;
-        if self.grid.costs.has_modifiers() && nav_cost_generation() != self.grid.cost_generation {
+        if self.cost_changes_stale() {
             return Ok(MultiJobProgress::StaleCosts);
         }
         match progress {
@@ -421,6 +471,7 @@ impl MultiSearchJob {
             SearchProgress::NoPath => Ok(MultiJobProgress::NoPath),
             SearchProgress::Stale => Ok(MultiJobProgress::Stale),
             SearchProgress::StaleCosts => Ok(MultiJobProgress::StaleCosts),
+            SearchProgress::StalePassFlags => Ok(MultiJobProgress::StalePassFlags),
             SearchProgress::Found(nodes, actions) => Ok(MultiJobProgress::Found(nodes, actions)),
         }
     }

@@ -310,7 +310,7 @@ dependencies = [
 
 [[package]]
 name = "navmap-pathfinder"
-version = "1.0.11"
+version = "1.0.12"
 dependencies = [
  "meowtonin",
  "thiserror",
