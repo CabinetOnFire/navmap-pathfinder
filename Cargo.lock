@@ -252,12 +252,12 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "meowtonin"
-version = "0.3.4"
-source = "git+https://github.com/CabinetOnFire/meowtonin.git?branch=reffix#12acb254000758c7cf18b8f7373bfa59e4435649"
+version = "0.3.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2f84c9f6b0cef8b79b768c766fc8436a05289aa860967a06cd82cdd851aafed5"
 dependencies = [
  "aho-corasick",
  "backtrace",
- "bytemuck",
  "cfg-if",
  "constcat",
  "inventory",
@@ -278,8 +278,9 @@ dependencies = [
 
 [[package]]
 name = "meowtonin-byondapi-sys"
-version = "0.3.4"
-source = "git+https://github.com/CabinetOnFire/meowtonin.git?branch=reffix#12acb254000758c7cf18b8f7373bfa59e4435649"
+version = "0.3.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "738de9d9880c54e90c067cf54e1ee6bf0d738749f19a2a68592ffbbc985143fa"
 dependencies = [
  "bytemuck",
  "cfg-if",
@@ -288,8 +289,9 @@ dependencies = [
 
 [[package]]
 name = "meowtonin-impl"
-version = "0.3.4"
-source = "git+https://github.com/CabinetOnFire/meowtonin.git?branch=reffix#12acb254000758c7cf18b8f7373bfa59e4435649"
+version = "0.3.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "01e5736dcebeed8e711e27a680baa71d9dbae29f4381538c4021f0f0425b76aa"
 dependencies = [
  "darling",
  "proc-macro2",
@@ -308,7 +310,7 @@ dependencies = [
 
 [[package]]
 name = "navmap-pathfinder"
-version = "1.0.10"
+version = "1.0.11"
 dependencies = [
  "meowtonin",
  "thiserror",

@@ -1,7 +1,7 @@
 [package]
 name = "navmap-pathfinder"
 edition = "2024"
-version = "1.0.10"
+version = "1.0.11"
 authors = ["CabinetOnFire"]
 repository = "https://github.com/CabinetOnFire/navmap-pathfinder"
 license = "AGPL-3.0-only"
@@ -18,12 +18,9 @@ lto = true
 debug = true
 
 [dependencies]
-meowtonin = "0.3.3"
+meowtonin = "0.3.5"
 thiserror = "2.0"
 tracy-client = { version = "0.18.4", optional = true, default-features = false, features = ["enable", "ondemand", "only-localhost", "delayed-init"] }
-
-[patch.crates-io]
-meowtonin = { git = "https://github.com/CabinetOnFire/meowtonin.git", branch = "reffix" }
 
 [features]
 default = []
