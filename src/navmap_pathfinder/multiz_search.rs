@@ -1,5 +1,6 @@
 //! Layered topology traversal and resumable multi-z A* search.
 
+use super::grid::{HorizontalGridAccess, diagonal_routes, horizontal_successors, resolve_turf};
 use super::search::{expand_path_diagonals, nav_link_estimate};
 use super::*;
 
@@ -18,7 +19,7 @@ impl NavLinkHeuristic {
         }
     }
 
-    fn estimate(&self, node: LayeredNode) -> u32 {
+    fn estimate(&self, node: LayeredNode) -> Option<u32> {
         nav_link_estimate(
             node,
             self.goal,
@@ -52,80 +53,15 @@ impl LayeredGrid {
             self.cache.insert(node, None);
             return Ok(None);
         };
-        let coords = (node.x, node.y, z);
-        let observed_generation = nav_cost_generation();
-        let entry = match cached_nav_data(coords) {
-            Some(data) if data.nav_pass & BAKED_FLAG != 0 => {
-                if let Some((open_edges, vertical_open)) =
-                    cached_unconditional_edges(data.nav_pass, self.is_flying)
-                {
-                    Some(TurfInfo {
-                        open_edges: open_edges | (vertical_open << 24),
-                        simulated: nav_pass_is_simulated(data.nav_pass),
-                        cost_flags: data.nav_cost_flags,
-                        cost_generation: observed_generation,
-                    })
-                } else {
-                    let turf = locate_xyz(ByondXYZ::new(node.x, node.y, z))?;
-                    if turf.is_null() {
-                        None
-                    } else {
-                        let (open_edges, vertical_open, nav_pass, cost_flags) =
-                            self.resolve_edges(coords, &turf, pass_info)?;
-                        Some(TurfInfo {
-                            open_edges: open_edges | (vertical_open << 24),
-                            simulated: nav_pass_is_simulated(nav_pass),
-                            cost_flags,
-                            cost_generation: observed_generation,
-                        })
-                    }
-                }
-            }
-            _ => {
-                let turf = locate_xyz(ByondXYZ::new(node.x, node.y, z))?;
-                if turf.is_null() {
-                    None
-                } else {
-                    let (open_edges, vertical_open, nav_pass, cost_flags) =
-                        self.resolve_edges(coords, &turf, pass_info)?;
-                    Some(TurfInfo {
-                        open_edges: open_edges | (vertical_open << 24),
-                        simulated: nav_pass_is_simulated(nav_pass),
-                        cost_flags,
-                        cost_generation: observed_generation,
-                    })
-                }
-            }
-        };
+        let entry = resolve_turf(
+            (node.x, node.y, z),
+            self.is_flying,
+            true,
+            self.pass_flags,
+            pass_info,
+        )?;
         self.cache.insert(node, entry);
         Ok(entry)
-    }
-
-    /// Resolves horizontal and vertical edges for a layered turf.
-    fn resolve_edges(
-        &self,
-        coords: TurfCoords,
-        turf: &ByondValue,
-        pass_info: &ByondValue,
-    ) -> Result<(i32, i32, i32, u32), NavPathError> {
-        let cached = cached_nav_data(coords);
-        let (mut nav_pass, mut cost_flags) = match cached {
-            Some(data) => (data.nav_pass, data.nav_cost_flags),
-            None => (read_nav_pass(turf)?, read_nav_cost_flags(turf)?),
-        };
-        if nav_pass & BAKED_FLAG == 0 {
-            let _: () = turf.call("nav_bake", std::iter::empty::<ByondValue>())?;
-            nav_pass = read_nav_pass(turf)?;
-            cost_flags = read_nav_cost_flags(turf)?;
-            if nav_pass & BAKED_FLAG == 0 {
-                return Ok((0, 0, nav_pass, cost_flags));
-            }
-        }
-        cache_nav_data(coords, nav_pass, cost_flags);
-        let (open, vertical) = resolve_packed_edges(nav_pass, self.is_flying, true, |dir| {
-            evaluate_conditional_edge(turf, dir, self.pass_flags, pass_info)
-        })?;
-        Ok((open, vertical, nav_pass, cost_flags))
     }
 
     /// Returns cached node data when the node is occupiable.
@@ -169,42 +105,7 @@ impl LayeredGrid {
                 east_west_first: false,
             });
         };
-        let dx = to.x - from.x;
-        let dy = to.y - from.y;
-        let ns = if dy > 0 { NORTH } else { SOUTH };
-        let ew = if dx > 0 { EAST } else { WEST };
-        if source.open_edges & ns == 0 && source.open_edges & ew == 0 {
-            return Ok(DiagonalRoutes {
-                north_south_first: false,
-                east_west_first: false,
-            });
-        }
-        if self.occupiable_info(to, pass_info)?.is_none() {
-            return Ok(DiagonalRoutes {
-                north_south_first: false,
-                east_west_first: false,
-            });
-        }
-        let ns_node = LayeredNode {
-            x: from.x,
-            y: to.y,
-            ..from
-        };
-        let ew_node = LayeredNode {
-            x: to.x,
-            y: from.y,
-            ..from
-        };
-        Ok(DiagonalRoutes {
-            north_south_first: source.open_edges & ns != 0
-                && self
-                    .occupiable_info(ns_node, pass_info)?
-                    .is_some_and(|info| info.open_edges & ew != 0),
-            east_west_first: source.open_edges & ew != 0
-                && self
-                    .occupiable_info(ew_node, pass_info)?
-                    .is_some_and(|info| info.open_edges & ns != 0),
-        })
+        diagonal_routes(self, source, from, (to.x, to.y), pass_info)
     }
 
     /// Returns horizontal, vertical, and navigation-link successors.
@@ -217,82 +118,7 @@ impl LayeredGrid {
         let Some(source) = self.lookup(from, pass_info)? else {
             return Ok(Vec::new());
         };
-        let mut out = Vec::with_capacity(12);
-        for (step, dx, dy, cost) in STEPS {
-            let to = LayeredNode {
-                x: from.x + dx,
-                y: from.y + dy,
-                ..from
-            };
-            if dx == 0 || dy == 0 {
-                if source.open_edges & step == 0 {
-                    continue;
-                }
-                let Some(destination) = self.occupiable_info(to, pass_info)? else {
-                    continue;
-                };
-                out.push((
-                    to,
-                    self.costs.step_cost(cost, destination.cost_flags),
-                    SearchAction::None,
-                ));
-            } else {
-                let routes = self.diagonal_routes(from, to, pass_info)?;
-                if !routes.north_south_first && !routes.east_west_first {
-                    continue;
-                }
-                let Some(destination) = self.occupiable_info(to, pass_info)? else {
-                    continue;
-                };
-                let expand_all = self.diagonal_handling == DiagonalHandling::RemoveAll;
-                let expand_clunky = self.diagonal_handling == DiagonalHandling::RemoveClunky
-                    && !routes.north_south_first
-                    && routes.east_west_first;
-                if expand_all || expand_clunky {
-                    let north_south_mid = LayeredNode {
-                        x: from.x,
-                        y: to.y,
-                        ..from
-                    };
-                    let east_west_mid = LayeredNode {
-                        x: to.x,
-                        y: from.y,
-                        ..from
-                    };
-                    let mut selected: Option<(u32, LayeredNode)> = None;
-                    if routes.north_south_first
-                        && let Some(mid) = self.occupiable_info(north_south_mid, pass_info)?
-                    {
-                        selected = Some((
-                            self.costs
-                                .step_cost(10, mid.cost_flags)
-                                .saturating_add(self.costs.step_cost(10, destination.cost_flags)),
-                            north_south_mid,
-                        ));
-                    }
-                    if routes.east_west_first
-                        && let Some(mid) = self.occupiable_info(east_west_mid, pass_info)?
-                    {
-                        let candidate = self
-                            .costs
-                            .step_cost(10, mid.cost_flags)
-                            .saturating_add(self.costs.step_cost(10, destination.cost_flags));
-                        if selected.is_none_or(|(old, _)| candidate < old) {
-                            selected = Some((candidate, east_west_mid));
-                        }
-                    }
-                    if let Some((route_cost, mid)) = selected {
-                        out.push((to, route_cost, SearchAction::Diagonal(mid.x, mid.y)));
-                    }
-                } else {
-                    out.push((
-                        to,
-                        self.costs.step_cost(cost, destination.cost_flags),
-                        SearchAction::None,
-                    ));
-                }
-            }
-        }
+        let mut out = horizontal_successors(self, from, pass_info)?;
         if self.is_flying {
             let vertical = source.open_edges >> 24;
             for (dir, delta) in [(UP, 1), (DOWN, -1)] {
@@ -318,11 +144,8 @@ impl LayeredGrid {
         let Some(source_z) = self.z_for(from) else {
             return Ok(out);
         };
-        if let Some(nav_links) = self
-            .nav_links_by_source
-            .get(&(from.x, from.y, source_z))
-            .cloned()
-        {
+        let nav_links_by_source = Arc::clone(&self.nav_links_by_source);
+        if let Some(nav_links) = nav_links_by_source.get(&(from.x, from.y, source_z)) {
             for nav_link in nav_links {
                 let Some(destination_layer) = self.topology.z_to_layer.get(&nav_link.destination.2)
                 else {
@@ -352,6 +175,36 @@ impl LayeredGrid {
             }
         }
         Ok(out)
+    }
+}
+
+impl HorizontalGridAccess<LayeredNode> for LayeredGrid {
+    fn horizontal_info(
+        &mut self,
+        node: LayeredNode,
+        pass_info: &ByondValue,
+    ) -> Result<Option<TurfInfo>, NavPathError> {
+        self.occupiable_info(node, pass_info)
+    }
+
+    fn horizontal_node(&self, reference: LayeredNode, position: Coord) -> LayeredNode {
+        LayeredNode {
+            x: position.0,
+            y: position.1,
+            ..reference
+        }
+    }
+
+    fn horizontal_position(&self, node: LayeredNode) -> Coord {
+        (node.x, node.y)
+    }
+
+    fn horizontal_cost(&mut self, base: u32, flags: u32) -> u32 {
+        self.costs.step_cost(base, flags)
+    }
+
+    fn diagonal_handling(&self) -> DiagonalHandling {
+        self.diagonal_handling
     }
 }
 
@@ -406,20 +259,20 @@ impl MultiSearchJob {
     pub(super) fn step(
         &mut self,
         pass_info: &ByondValue,
-    ) -> Result<MultiJobProgress, NavPathError> {
+    ) -> Result<SearchProgress<LayeredNode>, NavPathError> {
         tracy_span!("navmap.multi_search_step");
         self.last_touched = Instant::now();
         if topology_generation() != self.grid.topology.generation {
-            return Ok(MultiJobProgress::Stale);
+            return Ok(SearchProgress::Stale);
         }
         if self.grid.allow_nav_links && nav_link_generation() != self.grid.topology.generation {
-            return Ok(MultiJobProgress::Stale);
+            return Ok(SearchProgress::Stale);
         }
         if pass_flags_from_byond(pass_info)? != self.grid.pass_flags {
-            return Ok(MultiJobProgress::StalePassFlags);
+            return Ok(SearchProgress::StalePassFlags);
         }
         if self.cost_changes_stale() {
-            return Ok(MultiJobProgress::StaleCosts);
+            return Ok(SearchProgress::StaleCosts);
         }
         let deadline = Instant::now() + SLICE_BUDGET;
         if let Some(builder) = &mut self.heuristic_builder {
@@ -427,7 +280,7 @@ impl MultiSearchJob {
             if !builder.advance(deadline, |from, to, distance| {
                 relaxed_distance(from, to, distance, is_flying)
             }) {
-                return Ok(MultiJobProgress::InProgress);
+                return Ok(SearchProgress::InProgress);
             }
             self.heuristic = NavLinkHeuristic::from_source_distances(
                 self.goal,
@@ -444,9 +297,11 @@ impl MultiSearchJob {
         let heuristic_scale = self.grid.costs.heuristic_scale;
         if !self.search.is_initialized() {
             if !self.grid.can_occupy(self.grid.start, pass_info)? {
-                return Ok(MultiJobProgress::NoPath);
+                return Ok(SearchProgress::NoPath);
             }
-            let estimate = self.heuristic.estimate(self.grid.start);
+            let Some(estimate) = self.heuristic.estimate(self.grid.start) else {
+                return Ok(SearchProgress::NoPath);
+            };
             self.search.initialize(
                 self.grid.start,
                 CostProfile::scale_heuristic(estimate, heuristic_scale),
@@ -461,19 +316,16 @@ impl MultiSearchJob {
                     && chebyshev_distance((node.x, node.y), (goal.x, goal.y)) <= min_target_distance
             },
             |node| self.grid.successors(node, pass_info),
-            |node| CostProfile::scale_heuristic(self.heuristic.estimate(node), heuristic_scale),
+            |node| {
+                self.heuristic
+                    .estimate(node)
+                    .map(|estimate| CostProfile::scale_heuristic(estimate, heuristic_scale))
+            },
         )?;
         if self.cost_changes_stale() {
-            return Ok(MultiJobProgress::StaleCosts);
+            return Ok(SearchProgress::StaleCosts);
         }
-        match progress {
-            SearchProgress::InProgress => Ok(MultiJobProgress::InProgress),
-            SearchProgress::NoPath => Ok(MultiJobProgress::NoPath),
-            SearchProgress::Stale => Ok(MultiJobProgress::Stale),
-            SearchProgress::StaleCosts => Ok(MultiJobProgress::StaleCosts),
-            SearchProgress::StalePassFlags => Ok(MultiJobProgress::StalePassFlags),
-            SearchProgress::Found(nodes, actions) => Ok(MultiJobProgress::Found(nodes, actions)),
-        }
+        Ok(progress)
     }
 
     /// Rechecks and converts a layered path to DM values.

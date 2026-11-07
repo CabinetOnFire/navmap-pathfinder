@@ -63,8 +63,8 @@ fn navmap_pathfinder_ffi(
             };
             loop {
                 match job.step(&pass_info)? {
-                    MultiJobProgress::InProgress => continue,
-                    MultiJobProgress::NoPath => {
+                    SearchProgress::InProgress => continue,
+                    SearchProgress::NoPath => {
                         return status_response_with_actions(
                             "no_path",
                             None,
@@ -73,16 +73,16 @@ fn navmap_pathfinder_ffi(
                             None,
                         );
                     }
-                    MultiJobProgress::Stale => {
+                    SearchProgress::Stale => {
                         return status_response("stale_topology", None, None, None);
                     }
-                    MultiJobProgress::StaleCosts => {
+                    SearchProgress::StaleCosts => {
                         return status_response("stale_costs", None, None, None);
                     }
-                    MultiJobProgress::StalePassFlags => {
+                    SearchProgress::StalePassFlags => {
                         return status_response("stale_pass_flags", None, None, None);
                     }
-                    MultiJobProgress::Found(nodes, actions) => {
+                    SearchProgress::Found(nodes, actions) => {
                         let (path, actions) = job.final_path(nodes, actions, &pass_info)?;
                         if let Some(status) = job.final_stale_status(&pass_info)? {
                             return status_response(status, None, None, None);
@@ -365,7 +365,7 @@ fn navmap_update_ffi(
         coords_from_values(&x, &y, &z)?,
         nav_pass.get_number()? as i32,
         nav_cost_flags.get_number().unwrap_or(0.0).max(0.0) as u32,
-    );
+    )?;
     Ok(ByondValue::NULL)
 }
 
@@ -383,7 +383,7 @@ fn navmap_bulk_update_ffi(flat_list: ByondValue) -> Result<ByondValue, NavPathEr
             coords_from_values(&entry[0], &entry[1], &entry[2])?,
             entry[3].get_number()? as i32,
             entry[4].get_number().unwrap_or(0.0).max(0.0) as u32,
-        );
+        )?;
     }
     Ok(ByondValue::NULL)
 }
@@ -414,7 +414,7 @@ fn navmap_topology_update_ffi(
                 .insert(z, LayerLocation { group, layer });
             topology.layer_to_z.insert((group, layer), z);
         }
-        *TOPOLOGY.lock().unwrap_or_else(|p| p.into_inner()) = topology;
+        *TOPOLOGY.lock().unwrap_or_else(|p| p.into_inner()) = Arc::new(topology);
         Ok(ByondValue::new_num((values.len() / 3) as f32))
     })
 }
@@ -507,11 +507,9 @@ fn navmap_links_update_ffi(
         *NAV_LINKS.lock().unwrap_or_else(|p| p.into_inner()) = nav_links;
         *NAV_LINKS_BY_SOURCE
             .lock()
-            .unwrap_or_else(|p| p.into_inner()) = nav_links_by_source;
-        TOPOLOGY
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .links_generation = generation;
+            .unwrap_or_else(|p| p.into_inner()) = Arc::new(nav_links_by_source);
+        let mut topology = TOPOLOGY.lock().unwrap_or_else(|p| p.into_inner());
+        Arc::make_mut(&mut topology).links_generation = generation;
         Ok(ByondValue::new_num(nav_link_count as f32))
     })
 }

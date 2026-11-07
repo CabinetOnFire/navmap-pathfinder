@@ -5,7 +5,7 @@ use meowtonin::misc::locate_xyz;
 use meowtonin::{ByondError, ByondValue, ByondXYZ, ToByond, call_global};
 use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::sync::{
-    LazyLock, Mutex,
+    Arc, LazyLock, Mutex,
     atomic::{AtomicU64, Ordering as AtomicOrdering},
 };
 use std::time::{Duration, Instant};
@@ -75,11 +75,76 @@ const STEPS: [(i32, i16, i16, u32); 8] = [
 type TurfCoords = (i16, i16, i16);
 /// A two-dimensional turf position.
 type Coord = (i16, i16);
+type NavLinkIndex = HashMap<TurfCoords, Vec<NavLink>>;
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct CachedNavData {
     nav_pass: i32,
     nav_cost_flags: u32,
+}
+
+/// Dense, one-based turf storage, with planes allocated only when a z-level is used.
+#[derive(Default)]
+struct NavPassCache {
+    width: usize,
+    height: usize,
+    planes: Vec<Option<Vec<Option<CachedNavData>>>>,
+}
+
+impl NavPassCache {
+    fn get(&self, (x, y, z): TurfCoords) -> Option<CachedNavData> {
+        let (x, y, z) = (
+            usize::try_from(x).ok()?,
+            usize::try_from(y).ok()?,
+            usize::try_from(z).ok()?,
+        );
+        if x == 0 || y == 0 || z == 0 || x > self.width || y > self.height {
+            return None;
+        }
+        self.planes
+            .get(z - 1)?
+            .as_ref()?
+            .get((y - 1) * self.width + (x - 1))?
+            .to_owned()
+    }
+
+    fn insert(&mut self, (x, y, z): TurfCoords, data: CachedNavData) -> Option<CachedNavData> {
+        let (x, y, z) = (
+            usize::try_from(x).ok()?,
+            usize::try_from(y).ok()?,
+            usize::try_from(z).ok()?,
+        );
+        if x == 0 || y == 0 || z == 0 || x > self.width || y > self.height || z > self.planes.len()
+        {
+            return None;
+        }
+        let plane = self.planes[z - 1].get_or_insert_with(|| vec![None; self.width * self.height]);
+        plane[(y - 1) * self.width + (x - 1)].replace(data)
+    }
+
+    fn grow_to(&mut self, width: usize, height: usize, z_count: usize) {
+        let width = width.max(self.width);
+        let height = height.max(self.height);
+        let old_width = self.width;
+        let old_height = self.height;
+        if width != old_width || height != old_height {
+            for plane in self.planes.iter_mut().flatten() {
+                let mut grown = vec![None; width * height];
+                for y in 0..old_height {
+                    let old_row = y * old_width;
+                    let new_row = y * width;
+                    grown[new_row..new_row + old_width]
+                        .clone_from_slice(&plane[old_row..old_row + old_width]);
+                }
+                *plane = grown;
+            }
+            self.width = width;
+            self.height = height;
+        }
+        if z_count > self.planes.len() {
+            self.planes.resize_with(z_count, || None);
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -98,8 +163,8 @@ struct CostChangeHistory {
 const COST_CHANGE_HISTORY_LIMIT: usize = 65_536;
 
 /// Cached packed passability and terrain-cost values received from DM.
-static NAV_PASS_CACHE: LazyLock<Mutex<HashMap<TurfCoords, CachedNavData>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+static NAV_PASS_CACHE: LazyLock<Mutex<NavPassCache>> =
+    LazyLock::new(|| Mutex::new(NavPassCache::default()));
 /// Generation used to invalidate yielded searches after a published cost change.
 static NAV_COST_CHANGES: LazyLock<Mutex<CostChangeHistory>> =
     LazyLock::new(|| Mutex::new(CostChangeHistory::default()));
@@ -110,13 +175,14 @@ static SEARCH_JOBS: LazyLock<Mutex<HashMap<u64, SearchJob>>> =
 static MULTI_SEARCH_JOBS: LazyLock<Mutex<HashMap<u64, MultiSearchJob>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 /// Native multi-z topology.
-static TOPOLOGY: LazyLock<Mutex<Topology>> = LazyLock::new(|| Mutex::new(Topology::default()));
+static TOPOLOGY: LazyLock<Mutex<Arc<Topology>>> =
+    LazyLock::new(|| Mutex::new(Arc::new(Topology::default())));
 /// Registered navigation links.
 static NAV_LINKS: LazyLock<Mutex<HashMap<u64, NavLink>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 /// Registered navigation links indexed by source turf for cheap search snapshots.
-static NAV_LINKS_BY_SOURCE: LazyLock<Mutex<HashMap<TurfCoords, Vec<NavLink>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+static NAV_LINKS_BY_SOURCE: LazyLock<Mutex<Arc<NavLinkIndex>>> =
+    LazyLock::new(|| Mutex::new(Arc::new(NavLinkIndex::new())));
 /// Monotonic identifier source for search jobs.
 static NEXT_JOB_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -140,6 +206,49 @@ enum NavPathError {
     InvalidNavLinks,
     #[error("search range and path cost arguments must be finite nonnegative integers")]
     InvalidSearchArgument,
+    #[error("BYOND world dimensions must be positive integers")]
+    InvalidWorldDimensions,
+}
+
+fn read_world_dimension(name: &str) -> Result<usize, NavPathError> {
+    let value: ByondValue = ByondValue::world().read_var(name)?;
+    let number = value
+        .get_number()
+        .map_err(|_| NavPathError::InvalidWorldDimensions)?;
+    if !number.is_finite() || number < 1.0 || number.fract() != 0.0 || number > i16::MAX as f32 {
+        return Err(NavPathError::InvalidWorldDimensions);
+    }
+    Ok(number as usize)
+}
+
+fn world_dimensions() -> Result<(usize, usize, usize), NavPathError> {
+    Ok((
+        read_world_dimension("maxx")?,
+        read_world_dimension("maxy")?,
+        read_world_dimension("maxz")?,
+    ))
+}
+
+fn ensure_cache_bounds(coords: TurfCoords) -> Result<(), NavPathError> {
+    let (x, y, z) = coords;
+    if x <= 0 || y <= 0 || z <= 0 {
+        return Err(NavPathError::InvalidWorldDimensions);
+    }
+    let cache = NAV_PASS_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+    let inside =
+        x as usize <= cache.width && y as usize <= cache.height && z as usize <= cache.planes.len();
+    drop(cache);
+    if inside {
+        return Ok(());
+    }
+
+    let (world_width, world_height, world_z_count) = world_dimensions()?;
+    let mut cache = NAV_PASS_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+    cache.grow_to(world_width, world_height, world_z_count);
+    if x as usize > cache.width || y as usize > cache.height || z as usize > cache.planes.len() {
+        return Err(NavPathError::InvalidWorldDimensions);
+    }
+    Ok(())
 }
 
 /// Controls how diagonal steps are returned to DM.
@@ -302,7 +411,7 @@ struct Grid {
     /// Optional turf excluded from the search.
     avoid: Option<Coord>,
     /// Same-z navigation links included in this search, indexed by source coordinate.
-    nav_links_by_source: HashMap<Coord, Vec<NavLink>>,
+    nav_links_by_source: Arc<NavLinkIndex>,
     /// Cached turf lookups.
     cache: HashMap<Coord, Option<TurfInfo>>,
     /// Search-specific terrain cost weights.
@@ -416,7 +525,7 @@ struct FlatNavLinkHeuristic {
 /// Multi-z search grid and its per-job cache.
 struct LayeredGrid {
     /// Topology snapshot used by this search.
-    topology: Topology,
+    topology: Arc<Topology>,
     /// Pass flags for conditional blockers.
     pass_flags: i32,
     /// Whether flying edges should be used.
@@ -436,23 +545,13 @@ struct LayeredGrid {
     /// Optional node excluded from the search.
     avoid: Option<LayeredNode>,
     /// Cross-z navigation links indexed by their source turf for O(out-degree) expansion.
-    nav_links_by_source: HashMap<TurfCoords, Vec<NavLink>>,
+    nav_links_by_source: Arc<NavLinkIndex>,
     /// Cached node lookups.
     cache: HashMap<LayeredNode, Option<TurfInfo>>,
     /// Search-specific terrain cost weights.
     costs: CostProfile,
     /// Cost generation at search start.
     cost_generation: u64,
-}
-
-/// Result of one multi-z search slice.
-enum MultiJobProgress {
-    InProgress,
-    Found(Vec<LayeredNode>, Vec<SearchAction>),
-    NoPath,
-    Stale,
-    StaleCosts,
-    StalePassFlags,
 }
 
 /// Resumable multi-z A* search state.
@@ -588,7 +687,7 @@ fn new_multi_search_job(
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
     } else {
-        HashMap::new()
+        Arc::new(HashMap::new())
     };
     let nav_links: Vec<NavLink> = nav_links_by_source.values().flatten().copied().collect();
     let heuristic_edges: Vec<_> = nav_links
@@ -616,7 +715,7 @@ fn new_multi_search_job(
     let is_flying = truthy(&is_flying);
     Ok(Some(MultiSearchJob {
         grid: LayeredGrid {
-            topology: topology.clone(),
+            topology: Arc::clone(&topology),
             pass_flags,
             is_flying,
             allow_nav_links,
@@ -662,8 +761,7 @@ fn cached_nav_data(coords: TurfCoords) -> Option<CachedNavData> {
     NAV_PASS_CACHE
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .get(&coords)
-        .copied()
+        .get(coords)
 }
 
 fn read_nav_cost_flags(turf: &ByondValue) -> Result<u32, NavPathError> {
@@ -686,7 +784,7 @@ fn nav_cost_generation() -> u64 {
 fn cost_generation_since<ObservedGeneration>(
     generation: u64,
     modifier_mask: u32,
-    mut observed_generation: ObservedGeneration,
+    observed_generation: ObservedGeneration,
 ) -> Option<u64>
 where
     ObservedGeneration: FnMut(TurfCoords) -> Option<u64>,
@@ -694,6 +792,18 @@ where
     let history = NAV_COST_CHANGES
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cost_generation_since_in_history(&history, generation, modifier_mask, observed_generation)
+}
+
+fn cost_generation_since_in_history<ObservedGeneration>(
+    history: &CostChangeHistory,
+    generation: u64,
+    modifier_mask: u32,
+    mut observed_generation: ObservedGeneration,
+) -> Option<u64>
+where
+    ObservedGeneration: FnMut(TurfCoords) -> Option<u64>,
+{
     if history
         .changes
         .front()
@@ -802,25 +912,33 @@ where
 /// Stores one packed navmap value in the shared cache.
 #[cfg(test)]
 fn cache_nav_pass(coords: TurfCoords, nav_pass: i32) {
+    NAV_PASS_CACHE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .grow_to(20, 20, 10);
     let cost_flags = cached_nav_cost_flags(coords).unwrap_or(0);
-    cache_nav_data(coords, nav_pass, cost_flags);
+    let _ = cache_nav_data(coords, nav_pass, cost_flags);
 }
 
 /// Stores packed passability and modifier flags, invalidating cost-aware jobs on changes.
-fn cache_nav_data(coords: TurfCoords, nav_pass: i32, nav_cost_flags: u32) {
+fn cache_nav_data(
+    coords: TurfCoords,
+    nav_pass: i32,
+    nav_cost_flags: u32,
+) -> Result<(), NavPathError> {
     // DM publishes both baked values and invalidations here. Keeping an unbaked value is
     // intentional: resolve_edges will force a fresh bake before using it.
-    let mut cache = NAV_PASS_CACHE
+    ensure_cache_bounds(coords)?;
+    let previous = NAV_PASS_CACHE
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let previous = cache.insert(
-        coords,
-        CachedNavData {
-            nav_pass,
-            nav_cost_flags,
-        },
-    );
-    drop(cache);
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(
+            coords,
+            CachedNavData {
+                nav_pass,
+                nav_cost_flags,
+            },
+        );
     if let Some(previous) = previous {
         let changed_flags = previous.nav_cost_flags ^ nav_cost_flags;
         if changed_flags != 0 {
@@ -839,6 +957,7 @@ fn cache_nav_data(coords: TurfCoords, nav_pass: i32, nav_cost_flags: u32) {
             }
         }
     }
+    Ok(())
 }
 
 /// Reads packed navmap data from a DM turf.
@@ -1071,23 +1190,23 @@ fn run_multi_job(
     pass_info: &ByondValue,
 ) -> Result<(Option<MultiSearchJob>, ByondValue), NavPathError> {
     match job.step(pass_info)? {
-        MultiJobProgress::InProgress => Ok((
+        SearchProgress::InProgress => Ok((
             Some(job),
             status_response("in_progress", Some(job_id), None, None)?,
         )),
-        MultiJobProgress::Stale => Ok((
+        SearchProgress::Stale => Ok((
             None,
             status_response("stale_topology", Some(job_id), None, None)?,
         )),
-        MultiJobProgress::StaleCosts => Ok((
+        SearchProgress::StaleCosts => Ok((
             None,
             status_response("stale_costs", Some(job_id), None, None)?,
         )),
-        MultiJobProgress::StalePassFlags => Ok((
+        SearchProgress::StalePassFlags => Ok((
             None,
             status_response("stale_pass_flags", Some(job_id), None, None)?,
         )),
-        MultiJobProgress::NoPath => Ok((
+        SearchProgress::NoPath => Ok((
             None,
             status_response_with_actions(
                 "no_path",
@@ -1097,7 +1216,7 @@ fn run_multi_job(
                 None,
             )?,
         )),
-        MultiJobProgress::Found(nodes, actions) => {
+        SearchProgress::Found(nodes, actions) => {
             let (path, actions) = job.final_path(nodes, actions, pass_info)?;
             if let Some(status) = job.final_stale_status(pass_info)? {
                 return Ok((None, status_response(status, Some(job_id), None, None)?));
@@ -1157,28 +1276,18 @@ fn new_search_job(
         return Ok(None);
     }
     let pass_flags = pass_flags_from_byond(pass_info)?;
-    let mut nav_links_by_source: HashMap<Coord, Vec<NavLink>> = HashMap::new();
-    if truthy(&allow_nav_links) {
-        let nav_links_by_world_source = NAV_LINKS_BY_SOURCE
+    let nav_links_by_source = if truthy(&allow_nav_links) {
+        NAV_LINKS_BY_SOURCE
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        for (&(x, y, z), nav_links) in nav_links_by_world_source.iter() {
-            if z != sz {
-                continue;
-            }
-            for &nav_link in nav_links {
-                if nav_link.destination.2 == sz {
-                    nav_links_by_source
-                        .entry((x, y))
-                        .or_default()
-                        .push(nav_link);
-                }
-            }
-        }
-    }
-    let nav_links: Vec<NavLink> = nav_links_by_source.values().flatten().copied().collect();
-    let heuristic_edges: Vec<_> = nav_links
-        .iter()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    } else {
+        Arc::new(HashMap::new())
+    };
+    let heuristic_edges: Vec<_> = nav_links_by_source
+        .values()
+        .flatten()
+        .filter(|nav_link| nav_link.source.2 == sz && nav_link.destination.2 == sz)
         .map(|nav_link| {
             (
                 (nav_link.source.0, nav_link.source.1),

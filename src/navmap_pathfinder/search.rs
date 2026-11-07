@@ -98,7 +98,7 @@ where
     where
         IsGoal: FnMut(N) -> bool,
         Successors: FnMut(N) -> Result<Vec<(N, u32, SearchAction)>, E>,
-        Heuristic: FnMut(N) -> u32,
+        Heuristic: FnMut(N) -> Option<u32>,
     {
         self.step_until(
             Instant::now() + SLICE_BUDGET,
@@ -120,7 +120,7 @@ where
     where
         IsGoal: FnMut(N) -> bool,
         Successors: FnMut(N) -> Result<Vec<(N, u32, SearchAction)>, E>,
-        Heuristic: FnMut(N) -> u32,
+        Heuristic: FnMut(N) -> Option<u32>,
     {
         while Instant::now() < deadline {
             let Some(current) = self.frontier.pop() else {
@@ -139,9 +139,12 @@ where
                 if max_cost.is_some_and(|limit| limit > 0 && next_cost > limit) {
                     continue;
                 }
+                let Some(estimate) = heuristic(next) else {
+                    continue;
+                };
                 if self.costs.get(&next).is_none_or(|&old| next_cost < old) {
                     self.previous.insert(next, (current.node, action));
-                    self.push(next, next_cost, heuristic(next));
+                    self.push(next, next_cost, estimate);
                 }
             }
         }
@@ -232,7 +235,26 @@ where
     }
 
     /// Returns true when all link estimates are ready.
-    pub(super) fn advance<Relaxed>(
+    pub(super) fn advance<Relaxed>(&mut self, deadline: Instant, relaxed_distance: Relaxed) -> bool
+    where
+        Relaxed: FnMut(N, N, i32) -> Option<u32>,
+    {
+        self.advance_with_clock_check::<64, _>(deadline, relaxed_distance)
+    }
+
+    #[cfg(test)]
+    pub(super) fn advance_checking_every_work_unit<Relaxed>(
+        &mut self,
+        deadline: Instant,
+        relaxed_distance: Relaxed,
+    ) -> bool
+    where
+        Relaxed: FnMut(N, N, i32) -> Option<u32>,
+    {
+        self.advance_with_clock_check::<1, _>(deadline, relaxed_distance)
+    }
+
+    fn advance_with_clock_check<const CHECK_INTERVAL: usize, Relaxed>(
         &mut self,
         deadline: Instant,
         mut relaxed_distance: Relaxed,
@@ -240,7 +262,12 @@ where
     where
         Relaxed: FnMut(N, N, i32) -> Option<u32>,
     {
-        while Instant::now() < deadline {
+        let mut work_since_clock_check = 0;
+        loop {
+            if work_since_clock_check == 0 && Instant::now() >= deadline {
+                return false;
+            }
+            work_since_clock_check = (work_since_clock_check + 1) % CHECK_INTERVAL;
             if self.collect_index < self.edges.len() {
                 let (source, destination, _) = self.edges[self.collect_index];
                 self.collect_index += 1;
@@ -318,7 +345,6 @@ where
             }
             self.current = None;
         }
-        false
     }
 
     pub(super) fn finish(self) -> Option<Vec<(N, u32)>> {
@@ -351,7 +377,7 @@ pub(super) fn nav_link_estimate<N, Relaxed>(
     min_target_distance: i32,
     source_distances: &[(N, u32)],
     mut relaxed_distance: Relaxed,
-) -> u32
+) -> Option<u32>
 where
     N: Copy,
     Relaxed: FnMut(N, N, i32) -> Option<u32>,
@@ -364,7 +390,7 @@ where
         let through_link = to_source.saturating_add(distance);
         best = Some(best.map_or(through_link, |estimate| estimate.min(through_link)));
     }
-    best.unwrap_or(0)
+    best
 }
 
 impl FlatNavLinkHeuristic {
@@ -386,7 +412,7 @@ impl FlatNavLinkHeuristic {
         self
     }
 
-    pub(super) fn estimate(&self, node: Coord) -> u32 {
+    pub(super) fn estimate(&self, node: Coord) -> Option<u32> {
         nav_link_estimate(
             node,
             self.goal,
@@ -582,10 +608,13 @@ impl SearchJob {
             if !self.grid.can_occupy(self.grid.start, pass_info)? {
                 return Ok(SearchProgress::NoPath);
             }
-            let estimate = self.heuristic.as_ref().map_or_else(
-                || heuristic_to_target_range(self.grid.start, goal, min_target_distance),
-                |heuristic| heuristic.estimate(self.grid.start),
-            );
+            let estimate = self
+                .heuristic
+                .as_ref()
+                .and_then(|heuristic| heuristic.estimate(self.grid.start))
+                .unwrap_or_else(|| {
+                    heuristic_to_target_range(self.grid.start, goal, min_target_distance)
+                });
             self.search.initialize(
                 self.grid.start,
                 CostProfile::scale_heuristic(estimate, heuristic_scale),
@@ -597,11 +626,12 @@ impl SearchJob {
             |coord| chebyshev_distance(coord, goal) <= min_target_distance,
             |coord| self.grid.successors(coord, pass_info),
             |coord| {
-                let estimate = self.heuristic.as_ref().map_or_else(
-                    || heuristic_to_target_range(coord, goal, min_target_distance),
-                    |heuristic| heuristic.estimate(coord),
-                );
-                CostProfile::scale_heuristic(estimate, heuristic_scale)
+                let estimate = self
+                    .heuristic
+                    .as_ref()
+                    .and_then(|heuristic| heuristic.estimate(coord))
+                    .unwrap_or_else(|| heuristic_to_target_range(coord, goal, min_target_distance));
+                Some(CostProfile::scale_heuristic(estimate, heuristic_scale))
             },
         )?;
         if self.cost_changes_stale() {
