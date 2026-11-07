@@ -1,7 +1,7 @@
 [package]
 name = "navmap-pathfinder"
 edition = "2024"
-version = "1.0.13"
+version = "1.0.14"
 authors = ["CabinetOnFire"]
 repository = "https://github.com/CabinetOnFire/navmap-pathfinder"
 license = "AGPL-3.0-only"
@@ -19,6 +19,7 @@ debug = true
 
 [dependencies]
 meowtonin = "0.3.5"
+rustc-hash = "=2.1.3"
 thiserror = "2.0"
 tracy-client = { version = "0.18.4", optional = true, default-features = false, features = ["enable", "ondemand", "only-localhost", "delayed-init"] }
 

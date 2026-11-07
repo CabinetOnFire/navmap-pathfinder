@@ -310,9 +310,10 @@ dependencies = [
 
 [[package]]
 name = "navmap-pathfinder"
-version = "1.0.13"
+version = "1.0.14"
 dependencies = [
  "meowtonin",
+ "rustc-hash",
  "thiserror",
  "tracy-client",
 ]

@@ -2,7 +2,6 @@
 
 use super::*;
 use std::cmp::Ordering;
-use std::collections::HashSet;
 use std::hash::Hash;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -74,8 +73,8 @@ impl<N: Eq> Default for AStarCore<N> {
     fn default() -> Self {
         Self {
             frontier: BinaryHeap::new(),
-            costs: HashMap::new(),
-            previous: HashMap::new(),
+            costs: HashMap::default(),
+            previous: HashMap::default(),
             initialized: false,
             sequence: 0,
         }
@@ -218,8 +217,8 @@ where
             min_target_distance,
             edges,
             nodes: Vec::new(),
-            node_set: HashSet::new(),
-            distances: HashMap::new(),
+            node_set: HashSet::default(),
+            distances: HashMap::default(),
             frontier: BinaryHeap::new(),
             sequence: 0,
             collect_index: 0,

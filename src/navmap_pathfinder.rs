@@ -3,7 +3,8 @@
 
 use meowtonin::misc::locate_xyz;
 use meowtonin::{ByondError, ByondValue, ByondXYZ, ToByond, call_global};
-use std::collections::{BinaryHeap, HashMap, VecDeque};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use std::collections::{BinaryHeap, VecDeque};
 use std::sync::{
     Arc, LazyLock, Mutex,
     atomic::{AtomicU64, Ordering as AtomicOrdering},
@@ -170,19 +171,19 @@ static NAV_COST_CHANGES: LazyLock<Mutex<CostChangeHistory>> =
     LazyLock::new(|| Mutex::new(CostChangeHistory::default()));
 /// Active single-z search jobs.
 static SEARCH_JOBS: LazyLock<Mutex<HashMap<u64, SearchJob>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+    LazyLock::new(|| Mutex::new(HashMap::default()));
 /// Active multi-z search jobs.
 static MULTI_SEARCH_JOBS: LazyLock<Mutex<HashMap<u64, MultiSearchJob>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+    LazyLock::new(|| Mutex::new(HashMap::default()));
 /// Native multi-z topology.
 static TOPOLOGY: LazyLock<Mutex<Arc<Topology>>> =
     LazyLock::new(|| Mutex::new(Arc::new(Topology::default())));
 /// Registered navigation links.
 static NAV_LINKS: LazyLock<Mutex<HashMap<u64, NavLink>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+    LazyLock::new(|| Mutex::new(HashMap::default()));
 /// Registered navigation links indexed by source turf for cheap search snapshots.
 static NAV_LINKS_BY_SOURCE: LazyLock<Mutex<Arc<NavLinkIndex>>> =
-    LazyLock::new(|| Mutex::new(Arc::new(NavLinkIndex::new())));
+    LazyLock::new(|| Mutex::new(Arc::new(NavLinkIndex::default())));
 /// Monotonic identifier source for search jobs.
 static NEXT_JOB_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -340,7 +341,7 @@ impl CostProfile {
         }
         Ok(Self {
             modifiers,
-            combined: HashMap::new(),
+            combined: HashMap::default(),
             heuristic_scale,
         })
     }
@@ -687,7 +688,7 @@ fn new_multi_search_job(
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
     } else {
-        Arc::new(HashMap::new())
+        Arc::new(HashMap::default())
     };
     let nav_links: Vec<NavLink> = nav_links_by_source.values().flatten().copied().collect();
     let heuristic_edges: Vec<_> = nav_links
@@ -726,7 +727,7 @@ fn new_multi_search_job(
             simulated_only: truthy(&simulated_only),
             avoid,
             nav_links_by_source,
-            cache: HashMap::new(),
+            cache: HashMap::default(),
             costs,
             cost_generation,
         },
@@ -1282,7 +1283,7 @@ fn new_search_job(
             .unwrap_or_else(|p| p.into_inner())
             .clone()
     } else {
-        Arc::new(HashMap::new())
+        Arc::new(HashMap::default())
     };
     let heuristic_edges: Vec<_> = nav_links_by_source
         .values()
@@ -1315,7 +1316,7 @@ fn new_search_job(
             simulated_only: truthy(&simulated_only),
             avoid,
             nav_links_by_source,
-            cache: HashMap::new(),
+            cache: HashMap::default(),
             costs,
             cost_generation,
         },

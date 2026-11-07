@@ -462,8 +462,8 @@ fn navmap_links_update_ffi(
             return Err(NavPathError::InvalidNavLinks);
         }
         let generation = nonnegative_integer(&generation)?;
-        let mut nav_links = HashMap::new();
-        let mut nav_links_by_source: HashMap<TurfCoords, Vec<NavLink>> = HashMap::new();
+        let mut nav_links = HashMap::default();
+        let mut nav_links_by_source: HashMap<TurfCoords, Vec<NavLink>> = HashMap::default();
         for entry in values.chunks_exact(8) {
             let id = nonnegative_integer(&entry[0])?;
             if id == 0 {

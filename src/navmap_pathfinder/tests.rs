@@ -257,11 +257,11 @@ fn test_job(last_touched: Instant) -> SearchJob {
             diagonal_handling: DiagonalHandling::DoNothing,
             simulated_only: false,
             avoid: None,
-            nav_links_by_source: Arc::new(HashMap::new()),
-            cache: HashMap::new(),
+            nav_links_by_source: Arc::new(HashMap::default()),
+            cache: HashMap::default(),
             costs: CostProfile {
                 modifiers: Vec::new(),
-                combined: HashMap::new(),
+                combined: HashMap::default(),
                 heuristic_scale: 1.0,
             },
             cost_generation: 0,
@@ -281,7 +281,8 @@ fn test_job(last_touched: Instant) -> SearchJob {
 #[test]
 fn job_registry_prunes_expired_jobs_without_affecting_active_jobs() {
     let now = Instant::now();
-    let mut jobs = HashMap::from([
+    let mut jobs = HashMap::default();
+    jobs.extend([
         (1, test_job(now - IDLE_TIMEOUT - Duration::from_millis(1))),
         (2, test_job(now)),
         (3, test_job(now)),
